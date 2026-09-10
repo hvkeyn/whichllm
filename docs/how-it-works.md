@@ -9,6 +9,7 @@ The implementation is intentionally split into small packages:
 src/whichllm/
 ├── cli.py
 ├── constants.py
+├── data/
 ├── hardware/
 ├── models/
 ├── engine/
@@ -39,9 +40,10 @@ returns an empty result on failure.
 
 | Module | Role |
 | --- | --- |
-| `hardware/nvidia.py` | Uses `nvidia-ml-py`; falls back to `nvidia-smi` |
+| `hardware/nvidia.py` | Uses `nvidia-ml-py`; falls back to `nvidia-smi`, including optional memory-clock data |
 | `hardware/amd.py` | Uses `rocm-smi`; falls back to `lspci` and `/sys/class/drm` |
 | `hardware/intel.py` | Detects Linux Intel iGPUs through `lspci` or sysfs |
+| `hardware/windows.py` | Detects Windows AMD and Intel fallback GPUs through WMI and registry memory fields |
 | `hardware/apple.py` | Uses `system_profiler` on macOS |
 | `hardware/cpu.py` | Reads CPU name, physical cores, AVX2, and AVX-512 |
 | `hardware/memory.py` | Reads RAM and disk free space |
@@ -81,7 +83,8 @@ missing metadata.
 
 ## Caches
 
-Both caches live under `~/.cache/whichllm/`.
+Both caches normally live under `~/.cache/whichllm/`. If `XDG_CACHE_HOME` is
+set to an absolute path, whichllm uses `$XDG_CACHE_HOME/whichllm/` instead.
 
 | File | TTL | Contents |
 | --- | --- | --- |
@@ -162,26 +165,29 @@ For each candidate variant:
 
 1. Estimate memory.
 2. Check whether it can run.
-3. Estimate tok/s.
+3. Estimate tok/s and attach speed confidence/range metadata.
 4. Resolve benchmark evidence.
 5. Compute a quality score.
 6. Keep the best variant for the model family.
 
-The final sorting key includes the quality score, a fit bonus, and a small
-direct-benchmark bonus. Full-GPU candidates are preferred over comparable
-partial-offload candidates because they are usually more responsive in practice.
+The final sorting key stays close to the displayed quality score, with a small
+direct-benchmark bonus and a CPU-only penalty. Full-GPU candidates are already
+favored inside the score through the runtime-fit and speed adjustments, so the
+sort key does not add a second full-GPU bonus.
 
 See [Scoring](scoring.md) for the score details.
 
 ## Output
 
-`output/display.py` renders:
+Output is split by surface:
 
-- hardware panels
-- recommendation tables
-- JSON output
-- `plan` tables and JSON
-- `upgrade` comparison tables and JSON
+- `output/ranking.py` renders hardware panels and recommendation tables.
+- `output/json_output.py` renders ranking, `plan`, and `upgrade` JSON.
+- `output/plan.py` renders `plan` tables.
+- `output/upgrade.py` renders upgrade comparison tables.
+- `output/display.py` re-exports those functions for older imports.
 
-Normal ranking tables show published date and downloads. With `--status`, the
-table instead shows memory required, estimated speed, and fit type.
+Normal ranking tables show memory required, estimated generation speed, fit
+type, and published date. `--details` switches to download-oriented metadata.
+Speed color is based on absolute usability, while `~` marks estimates with a
+range and `?` marks low-confidence, backend-sensitive estimates.

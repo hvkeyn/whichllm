@@ -14,7 +14,7 @@ Set TypingSpeed 50ms
 
 # Warm up cache invisibly
 Hide
-Type "whichllm --top 1 > /dev/null 2>&1"
+Type "uvx whichllm@latest --top 1 > /dev/null 2>&1"
 Enter
 Sleep 10s
 Type "clear"
@@ -23,14 +23,14 @@ Sleep 500ms
 Show
 
 # Scene 1: Just run it
-Type "whichllm"
+Type "uvx whichllm@latest"
 Sleep 500ms
 Enter
 Sleep 6s
 Sleep 2s
 
 # Scene 2: What GPU do I need?
-Type "whichllm plan 'qwen 72b'"
+Type "uvx whichllm@latest plan 'qwen 72b'"
 Sleep 500ms
 Enter
 Sleep 6s

@@ -8,8 +8,19 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
-from whichllm.constants import AMD_SHARED_MEMORY_APU_MARKERS, GPU_BANDWIDTH, _GiB
+if TYPE_CHECKING:
+    from dbgpu import GPUSpecification
+
+from whichllm.constants import (
+    AMD_SHARED_MEMORY_APU_MARKERS,
+    CURATED_GPU_SPECS,
+    GPU_BANDWIDTH,
+    CuratedGPUSpec,
+    _GiB,
+)
 from whichllm.hardware.types import GPUInfo
 
 logger = logging.getLogger(__name__)
@@ -57,6 +68,9 @@ _APPLE_SILICON_CHIPS: dict[str, tuple[str, float]] = {
     "M4 Pro": ("Apple M4 Pro", 24.0),
     "M4 Max": ("Apple M4 Max", 36.0),
     "M4 Ultra": ("Apple M4 Ultra", 64.0),
+    "M5": ("Apple M5", 16.0),
+    "M5 Pro": ("Apple M5 Pro", 24.0),
+    "M5 Max": ("Apple M5 Max", 36.0),
 }
 
 
@@ -97,6 +111,14 @@ def _lookup_static_bandwidth(name: str) -> float | None:
     return None
 
 
+def _lookup_curated_spec(name: str) -> CuratedGPUSpec | None:
+    name_upper = name.upper()
+    for key in sorted(CURATED_GPU_SPECS, key=len, reverse=True):
+        if key.upper() in name_upper:
+            return CURATED_GPU_SPECS[key]
+    return None
+
+
 def _normalize_gpu_name(name: str) -> str:
     """Normalize user input: 'GTX1080' → 'GTX 1080', 'RX7900XTX' → 'RX 7900 XTX'."""
     # Insert space between letters and digits
@@ -129,7 +151,7 @@ def _substring_search(db, name: str):
     return None
 
 
-def _lookup_dbgpu(name: str):
+def _lookup_dbgpu(name: str) -> GPUSpecification | None:
     """Look up GPU spec from dbgpu database. Returns GPUSpecification or None."""
     from dbgpu import GPUDatabase
 
@@ -183,6 +205,54 @@ def _lookup_dbgpu(name: str):
 _last_suggestions: list[tuple[str, int]] = []
 
 
+def parse_synthetic_gpu_specs(values: Sequence[str] | str) -> list[str]:
+    """Expand CLI GPU simulation values into individual GPU names.
+
+    Accepts repeated options, comma-separated names, and count shorthand such
+    as ``2x RTX 4090``. The returned names are still looked up by
+    ``create_synthetic_gpu`` so existing fuzzy matching and aliases stay in
+    one place.
+    """
+    raw_values = [values] if isinstance(values, str) else list(values)
+    gpu_names: list[str] = []
+
+    for raw in raw_values:
+        for part in raw.split(","):
+            spec = part.strip()
+            if not spec:
+                raise ValueError("Empty GPU entry in --gpu.")
+
+            count_match = re.match(r"^(\d+)\s*x\s+(.+)$", spec, re.IGNORECASE)
+            if count_match:
+                count = int(count_match.group(1))
+                name = count_match.group(2).strip()
+                if count < 1:
+                    raise ValueError("GPU count must be at least 1.")
+                if not name:
+                    raise ValueError("GPU count shorthand requires a GPU name.")
+                gpu_names.extend([name] * count)
+            else:
+                gpu_names.append(spec)
+
+    if not gpu_names:
+        raise ValueError("At least one GPU must be specified.")
+    return gpu_names
+
+
+def create_synthetic_gpus(
+    values: Sequence[str] | str,
+    vram_override_gb: float | None = None,
+) -> list[GPUInfo]:
+    """Create one or more synthetic GPUs from CLI-style values."""
+    names = parse_synthetic_gpu_specs(values)
+    if vram_override_gb is not None and len(names) != 1:
+        raise ValueError(
+            "--vram currently supports exactly one simulated GPU. "
+            "For multi-GPU simulation, specify known GPU names and omit --vram."
+        )
+    return [create_synthetic_gpu(name, vram_override_gb) for name in names]
+
+
 def create_synthetic_gpu(name: str, vram_override_gb: float | None = None) -> GPUInfo:
     """Create a synthetic GPUInfo from a GPU name.
 
@@ -201,6 +271,7 @@ def create_synthetic_gpu(name: str, vram_override_gb: float | None = None) -> GP
     _last_suggestions.clear()
 
     amd_shared_memory_apu = _is_amd_shared_memory_apu(name)
+    curated = _lookup_curated_spec(name)
 
     # Apple Silicon short-circuit: dbgpu has no Apple entries, so we check
     # first to avoid fuzzy-matching "M1" against "Rage Mobility-M1".
@@ -213,6 +284,8 @@ def create_synthetic_gpu(name: str, vram_override_gb: float | None = None) -> GP
             vendor=vendor,
             vram_bytes=int(vram_gb * _GiB),
             memory_bandwidth_gbps=bandwidth,
+            shared_memory=True,
+            vram_overridden=vram_override_gb is not None,
         )
 
     spec = _lookup_dbgpu(name)
@@ -222,6 +295,8 @@ def create_synthetic_gpu(name: str, vram_override_gb: float | None = None) -> GP
         vram_bytes = int(vram_override_gb * _GiB)
     elif spec is not None and spec.memory_size_gb:
         vram_bytes = int(spec.memory_size_gb * _GiB)
+    elif curated is not None:
+        vram_bytes = int(curated.vram_gb * _GiB)
     else:
         msg = f"Unknown GPU '{name}'."
         if _last_suggestions:
@@ -234,6 +309,8 @@ def create_synthetic_gpu(name: str, vram_override_gb: float | None = None) -> GP
     bandwidth: float | None = None
     if spec is not None and spec.memory_bandwidth_gb_s:
         bandwidth = spec.memory_bandwidth_gb_s
+    if bandwidth is None and curated is not None:
+        bandwidth = curated.memory_bandwidth_gbps
     if bandwidth is None:
         bandwidth = _lookup_static_bandwidth(name)
 
@@ -246,10 +323,17 @@ def create_synthetic_gpu(name: str, vram_override_gb: float | None = None) -> GP
     vendor = "nvidia"
     if spec is not None:
         vendor = _MANUFACTURER_TO_VENDOR.get(spec.manufacturer, "nvidia")
+    elif curated is not None:
+        vendor = curated.vendor
     elif amd_shared_memory_apu:
         vendor = "amd"
 
-    display_name = spec.name if spec is not None else name
+    if spec is not None:
+        display_name = spec.name
+    elif curated is not None:
+        display_name = curated.name
+    else:
+        display_name = name
 
     return GPUInfo(
         name=f"{display_name} (simulated)",
@@ -257,5 +341,6 @@ def create_synthetic_gpu(name: str, vram_override_gb: float | None = None) -> GP
         vram_bytes=vram_bytes,
         compute_capability=compute_cap,
         memory_bandwidth_gbps=bandwidth,
-        shared_memory=amd_shared_memory_apu,
+        shared_memory=curated.shared_memory if curated else amd_shared_memory_apu,
+        vram_overridden=vram_override_gb is not None,
     )

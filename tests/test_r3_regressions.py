@@ -21,8 +21,8 @@ from whichllm.engine.ranker import rank_models
 from whichllm.hardware.gpu_simulator import create_synthetic_gpu
 from whichllm.hardware.types import GPUInfo, HardwareInfo
 from whichllm.models.benchmark import _params_compatible
-from whichllm.models.benchmark_sources.aa_index import AA_INDEX_FALLBACK_2026_05_14
-from whichllm.models.benchmark_sources.livebench import LIVEBENCH_FALLBACK_2026_04
+from whichllm.models.benchmark_sources.aa_index import AA_INDEX_FALLBACK_2026_06_29
+from whichllm.models.benchmark_sources.livebench import LIVEBENCH_RAW_DATA
 from whichllm.models.benchmark_sources.vision import VISION_FALLBACK_2026_05
 from whichllm.models.grouper import group_models
 from whichllm.models.types import GGUFVariant, ModelInfo
@@ -268,8 +268,8 @@ class TestReasoningSurface:
     surface in the ranking."""
 
     def test_qwq32b_has_curated_benchmarks(self):
-        assert "Qwen/QwQ-32B" in LIVEBENCH_FALLBACK_2026_04
-        assert "Qwen/QwQ-32B" in AA_INDEX_FALLBACK_2026_05_14
+        assert "Qwen/QwQ-32B" in LIVEBENCH_RAW_DATA
+        assert "Qwen/QwQ-32B" in AA_INDEX_FALLBACK_2026_06_29
 
     def test_r1_distill_family_has_curated_benchmarks(self):
         for mid in (
@@ -277,8 +277,8 @@ class TestReasoningSurface:
             "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
             "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
         ):
-            assert mid in LIVEBENCH_FALLBACK_2026_04, f"{mid} missing in LB"
-            assert mid in AA_INDEX_FALLBACK_2026_05_14, f"{mid} missing in AA"
+            assert mid in LIVEBENCH_RAW_DATA, f"{mid} missing in LB"
+            assert mid in AA_INDEX_FALLBACK_2026_06_29, f"{mid} missing in AA"
 
     def test_qwq32b_surfaces_with_curated_score(self):
         qwq = ModelInfo(
@@ -457,3 +457,273 @@ class TestApplePartialOffloadPenalty:
             f"PCIe-bound partial offload at equal bandwidth ({a:.1f} vs "
             f"{n:.1f})"
         )
+
+
+# ----------------------------------------------------------------- R3-8
+
+
+class TestMoESpeedEstimation:
+    """MoE speed estimation should use active params without letting
+    high-bandwidth GPUs turn sparse models into unrealistic outliers."""
+
+    def test_qwen3_next_strix_halo_matches_reported_generation_speed(self):
+        from whichllm.engine.performance import estimate_tok_per_sec
+
+        model = ModelInfo(
+            id="Qwen/Qwen3-Next-80B-A3B-Instruct",
+            family_id="qwen3-next-80b-a3b",
+            name="Qwen3-Next-80B-A3B-Instruct",
+            parameter_count=79_670_000_000,
+            parameter_count_active=3_000_000_000,
+            is_moe=True,
+        )
+        variant = GGUFVariant(
+            filename="qwen3next-q4_k_m.gguf",
+            quant_type="Q4_K_M",
+            file_size_bytes=int(45.17 * 1024**3),
+        )
+        strix_halo = GPUInfo(
+            name="STRXLGEN",
+            vendor="amd",
+            vram_bytes=0,
+            memory_bandwidth_gbps=256.0,
+            shared_memory=True,
+        )
+
+        speed = estimate_tok_per_sec(model, variant, strix_halo, "full_gpu")
+
+        assert 40.0 <= speed <= 50.0
+
+    def test_unknown_ultra_sparse_moe_uses_active_params_on_strix_halo(self):
+        from whichllm.engine.performance import estimate_tok_per_sec
+
+        model = ModelInfo(
+            id="unknown/Experimental-80B-A3B",
+            family_id="experimental-80b-a3b",
+            name="Experimental-80B-A3B",
+            parameter_count=79_670_000_000,
+            parameter_count_active=3_000_000_000,
+            is_moe=True,
+        )
+        variant = GGUFVariant(
+            filename="experimental-q4_k_m.gguf",
+            quant_type="Q4_K_M",
+            file_size_bytes=int(45.17 * 1024**3),
+        )
+        strix_halo = GPUInfo(
+            name="STRXLGEN",
+            vendor="amd",
+            vram_bytes=0,
+            memory_bandwidth_gbps=256.0,
+            shared_memory=True,
+        )
+
+        speed = estimate_tok_per_sec(model, variant, strix_halo, "full_gpu")
+
+        assert 40.0 <= speed <= 50.0
+
+    def test_qwen3_30b_a3b_strix_halo_no_longer_uses_legacy_floor(self):
+        from whichllm.engine.performance import estimate_tok_per_sec
+
+        model = ModelInfo(
+            id="Qwen/Qwen3-30B-A3B",
+            family_id="qwen3-30b-a3b",
+            name="Qwen3-30B-A3B",
+            parameter_count=30_000_000_000,
+            parameter_count_active=3_000_000_000,
+            is_moe=True,
+        )
+        variant = GGUFVariant(
+            filename="qwen3-30b-q4_k_m.gguf",
+            quant_type="Q4_K_M",
+            file_size_bytes=int(17.1 * 1024**3),
+        )
+        strix_halo = GPUInfo(
+            name="STRXLGEN",
+            vendor="amd",
+            vram_bytes=0,
+            memory_bandwidth_gbps=256.0,
+            shared_memory=True,
+        )
+
+        speed = estimate_tok_per_sec(model, variant, strix_halo, "full_gpu")
+
+        assert 50.0 <= speed <= 70.0
+
+    def test_high_bandwidth_gpu_keeps_moe_kernel_floor(self):
+        from whichllm.engine.performance import estimate_tok_per_sec
+
+        model = ModelInfo(
+            id="Qwen/Qwen3-30B-A3B",
+            family_id="qwen3-30b-a3b",
+            name="Qwen3-30B-A3B",
+            parameter_count=30_000_000_000,
+            parameter_count_active=3_000_000_000,
+            is_moe=True,
+        )
+        variant = _gguf("Q5_K_M", 20.6)
+        rtx_4090 = GPUInfo(
+            name="RTX 4090",
+            vendor="nvidia",
+            vram_bytes=24 * 1024**3,
+            compute_capability=(8, 9),
+            memory_bandwidth_gbps=1008.0,
+        )
+
+        speed = estimate_tok_per_sec(model, variant, rtx_4090, "full_gpu")
+
+        assert 100.0 <= speed <= 150.0
+
+    def test_deepseek_v4_flash_synthetic_q4_does_not_fit_strix_halo_96gb(self):
+        deepseek = ModelInfo(
+            id="deepseek-ai/DeepSeek-V4-Flash",
+            family_id="deepseek-v4-flash",
+            name="DeepSeek-V4-Flash",
+            parameter_count=284_000_000_000,
+            parameter_count_active=13_000_000_000,
+            is_moe=True,
+            downloads=1_000_000,
+            gguf_variants=[],
+        )
+        qwen_dense = ModelInfo(
+            id="Qwen/Qwen3.6-27B",
+            family_id="qwen3.6-27b",
+            name="Qwen3.6-27B",
+            parameter_count=27_000_000_000,
+            downloads=100_000,
+            gguf_variants=[],
+        )
+        hardware = HardwareInfo(
+            gpus=[
+                GPUInfo(
+                    name="Strix Halo",
+                    vendor="amd",
+                    vram_bytes=96 * 1024**3,
+                    memory_bandwidth_gbps=256.0,
+                    shared_memory=True,
+                )
+            ],
+            cpu_name="Ryzen AI MAX+ 395",
+            cpu_cores=16,
+            ram_bytes=128 * 1024**3,
+            disk_free_bytes=500 * 1024**3,
+            os="linux",
+        )
+
+        results = rank_models(
+            [deepseek, qwen_dense],
+            hardware,
+            top_n=5,
+            quant_filter="Q4_K_M",
+            benchmark_scores={
+                "deepseek-ai/DeepSeek-V4-Flash": 87.0,
+                "Qwen/Qwen3.6-27B": 84.0,
+            },
+        )
+
+        ids = [r.model.id for r in results]
+        assert "deepseek-ai/DeepSeek-V4-Flash" not in ids
+        assert "Qwen/Qwen3.6-27B" in ids
+
+
+class TestSpeedUncertainty:
+    def test_strix_halo_moe_speed_is_medium_confidence_with_range(self):
+        from whichllm.engine.performance import estimate_speed_uncertainty
+
+        model = ModelInfo(
+            id="unknown/Experimental-80B-A3B",
+            family_id="experimental-80b-a3b",
+            name="Experimental-80B-A3B",
+            parameter_count=79_670_000_000,
+            parameter_count_active=3_000_000_000,
+            is_moe=True,
+        )
+        variant = GGUFVariant(
+            filename="experimental-q4_k_m.gguf",
+            quant_type="Q4_K_M",
+            file_size_bytes=int(45.17 * 1024**3),
+        )
+        strix_halo = GPUInfo(
+            name="Strix Halo",
+            vendor="amd",
+            vram_bytes=96 * 1024**3,
+            memory_bandwidth_gbps=256.0,
+            shared_memory=True,
+        )
+
+        confidence, speed_range, notes = estimate_speed_uncertainty(
+            model, variant, strix_halo, "full_gpu", 48.0
+        )
+
+        assert confidence == "medium"
+        assert speed_range == (28.8, 76.8)
+        assert any("shared-memory APU" in note for note in notes)
+
+    def test_apple_silicon_moe_speed_is_low_confidence(self):
+        from whichllm.engine.performance import estimate_speed_uncertainty
+
+        model = ModelInfo(
+            id="google/gemma-4-26B-A4B-it",
+            family_id="gemma-4-26b-a4b-it",
+            name="gemma-4-26B-A4B-it",
+            parameter_count=26_000_000_000,
+            parameter_count_active=3_800_000_000,
+            is_moe=True,
+        )
+        variant = _gguf("Q4_K_M", 15.0)
+        apple = GPUInfo(
+            name="M3 Max",
+            vendor="apple",
+            vram_bytes=96 * 1024**3,
+            memory_bandwidth_gbps=400.0,
+            shared_memory=True,
+        )
+
+        confidence, speed_range, notes = estimate_speed_uncertainty(
+            model, variant, apple, "full_gpu", 30.0
+        )
+
+        assert confidence == "low"
+        assert speed_range == (10.5, 60.0)
+        assert any("Metal/MLX" in note for note in notes)
+
+    def test_synthetic_gguf_rank_result_exposes_speed_uncertainty(self):
+        model = ModelInfo(
+            id="Qwen/Qwen3-30B-A3B",
+            family_id="qwen3-30b-a3b",
+            name="Qwen3-30B-A3B",
+            parameter_count=30_000_000_000,
+            parameter_count_active=3_000_000_000,
+            is_moe=True,
+            downloads=1_000_000,
+        )
+        hardware = HardwareInfo(
+            gpus=[
+                GPUInfo(
+                    name="Strix Halo",
+                    vendor="amd",
+                    vram_bytes=96 * 1024**3,
+                    memory_bandwidth_gbps=256.0,
+                    shared_memory=True,
+                )
+            ],
+            cpu_name="Ryzen AI MAX+ 395",
+            cpu_cores=16,
+            ram_bytes=128 * 1024**3,
+            disk_free_bytes=500 * 1024**3,
+            os="linux",
+        )
+
+        result = rank_models(
+            [model],
+            hardware,
+            top_n=1,
+            quant_filter="Q4_K_M",
+            benchmark_scores={"Qwen/Qwen3-30B-A3B": 80.0},
+        )[0]
+
+        assert result.speed_confidence == "medium"
+        assert result.speed_range_tok_per_sec is not None
+        assert result.speed_range_tok_per_sec[0] < result.estimated_tok_per_sec
+        assert result.speed_range_tok_per_sec[1] > result.estimated_tok_per_sec
+        assert any("synthetic GGUF" in note for note in result.speed_notes)

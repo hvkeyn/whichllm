@@ -99,20 +99,17 @@ The candidate's runtime form matters:
 | Fit | Multiplier |
 | --- | ---: |
 | Full GPU | `1.00` |
-| Partial offload | `0.72` |
+| Partial offload | `0.42`-`0.88`, based on spill ratio |
 | CPU-only | `0.50` |
 
-The final family selection key also adds a fit bonus:
+Light partial offload is penalized less than heavy offload. MoE models receive
+a milder penalty when the active parameter working set can plausibly stay on
+GPU while inactive experts spill to CPU RAM.
 
-| Fit | Bonus |
-| --- | ---: |
-| Full GPU | `+15` |
-| Partial offload | `0` |
-| CPU-only | `-15` |
-
-This keeps a responsive full-GPU result ahead of a similar partial-offload
-result, without letting a very weak full-GPU model beat a much stronger model
-that only needs modest offload.
+The final family selection key does not add a separate full-GPU bonus. Runtime
+fit is already reflected in the quality score through the multiplier above and
+the speed adjustment below. CPU-only results receive a small extra sort penalty
+when mixed with GPU-backed candidates.
 
 ## Speed adjustment
 
@@ -132,6 +129,21 @@ it receive up to `+8` points.
 After ranking, if any candidate is at least `5 tok/s`, whichllm drops candidates
 below `1.5 tok/s`. This avoids recommending models that technically fit but are
 not practical to use.
+
+The reported speed is a point estimate, not a live benchmark. Ranking also
+exposes speed confidence:
+
+| Confidence | Range factor | Typical cases |
+| --- | ---: | --- |
+| `medium` | `0.60x`-`1.60x` | Normal GPU estimates, synthetic GGUF estimates, AMD shared-memory APU MoE estimates |
+| `low` | `0.35x`-`2.00x` | CPU-only, partial offload, unknown bandwidth, Apple Silicon MoE |
+| `high` | `0.85x`-`1.20x` | Reserved for future measured-speed data |
+
+Speed cells are colored by absolute usability: red is under `4 tok/s`, yellow
+is `4-10 tok/s`, green is `10-30 tok/s`, and bright green is `30+ tok/s`. `~`
+marks medium-confidence estimates with a range, and `?` marks low-confidence
+estimates. JSON exposes the same uncertainty data as `speed_confidence`,
+`speed_range_tok_per_sec`, and `speed_notes`.
 
 ## Source trust
 
@@ -172,6 +184,7 @@ Examples of tracked lineages include:
 - Kimi
 - Granite
 - OLMo
+- T5 (incl. Flan-T5, mT5, ByT5, T5Gemma)
 
 ## Benchmark markers
 

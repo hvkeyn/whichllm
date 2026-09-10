@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
-from importlib.metadata import PackageNotFoundError, version
 from typing import Optional
 
 import typer
 from rich.console import Console
 
+from whichllm.constants import _GiB
 from whichllm.hardware.types import HardwareInfo
-from whichllm.models.types import GGUFVariant, ModelInfo
+from whichllm.models.artifacts import (
+    attach_resolved_artifacts,
+    find_gguf_variant,
+    resolve_ranked_gguf_artifact,
+)
+from whichllm.models.types import ModelInfo
+from whichllm.utils import _current_version, CONTEXT_LENGTH
 
 app = typer.Typer(
     name="llm-checker",
@@ -21,18 +28,30 @@ app = typer.Typer(
 )
 console = Console()
 
+_find_gguf_variant = find_gguf_variant
+_resolve_ranked_gguf_for_run = resolve_ranked_gguf_artifact
+
 
 def _run_async(coro):
     """Run async coroutine from sync context."""
     return asyncio.run(coro)
 
 
-def _current_version() -> str:
-    """Return installed package version."""
-    try:
-        return version("whichllm")
-    except PackageNotFoundError:
-        return "unknown"
+def _format_fetch_error(error: Exception) -> str:
+    """Return a useful one-line fetch error even when str(error) is empty."""
+    detail = str(error).strip()
+    if detail:
+        return detail
+
+    response = getattr(error, "response", None)
+    request = getattr(error, "request", None) or getattr(response, "request", None)
+    status_code = getattr(response, "status_code", None)
+    url = getattr(request, "url", None)
+    if status_code and url:
+        return f"{type(error).__name__}: HTTP {status_code} for {url}"
+    if url:
+        return f"{type(error).__name__} while requesting {url}"
+    return f"{type(error).__name__} with no detail from the network layer"
 
 
 def _print_version(value: bool) -> None:
@@ -44,15 +63,65 @@ def _print_version(value: bool) -> None:
 
 def _validate_gpu_flags(
     cpu_only: bool,
-    gpu: str | None,
+    gpu: list[str] | None,
     vram: float | None,
+    bandwidth: float | None = None,
+    gpu_index: int | None = None,
 ) -> None:
     """Validate mutual exclusivity of GPU-related flags."""
     if cpu_only and gpu:
         console.print("[red]Error:[/] --cpu-only and --gpu are mutually exclusive.")
         raise typer.Exit(code=1)
-    if vram is not None and not gpu:
-        console.print("[red]Error:[/] --vram requires --gpu.")
+    if cpu_only and (vram is not None or bandwidth is not None):
+        console.print("[red]Error:[/] --cpu-only cannot be used with GPU overrides.")
+        raise typer.Exit(code=1)
+    if vram is not None and vram <= 0:
+        console.print("[red]Error:[/] --vram must be greater than 0.")
+        raise typer.Exit(code=1)
+    if bandwidth is not None and bandwidth <= 0:
+        console.print("[red]Error:[/] --bandwidth must be greater than 0.")
+        raise typer.Exit(code=1)
+    if gpu_index is not None and gpu_index < 0:
+        console.print("[red]Error:[/] --gpu-index must be 0 or greater.")
+        raise typer.Exit(code=1)
+    if gpu_index is not None and gpu:
+        console.print("[red]Error:[/] --gpu-index only applies to detected GPUs.")
+        raise typer.Exit(code=1)
+    if gpu_index is not None and vram is None and bandwidth is None:
+        console.print("[red]Error:[/] --gpu-index requires --vram or --bandwidth.")
+        raise typer.Exit(code=1)
+
+
+def _validate_output_flags(json_output: bool, markdown_output: bool) -> None:
+    """Validate mutually exclusive output formats."""
+    if json_output and markdown_output:
+        console.print("[red]Error:[/] --json and --markdown are mutually exclusive.")
+        raise typer.Exit(code=1)
+
+
+def _validate_ranking_flags(
+    top: int,
+    min_speed: float | None,
+    min_params: float | None,
+) -> None:
+    """Validate ranking/filter flags that otherwise silently distort output.
+
+    Without these guards a non-positive ``--top`` reaches ``results[:top_n]`` in
+    :func:`whichllm.engine.ranker.rank_models`: ``--top 0`` returns no
+    recommendations at all, and a negative value slices from the end
+    (``results[:-5]``), silently returning a truncated, unrequested subset
+    instead of the count the user asked for. Negative ``--min-speed`` /
+    ``--min-params`` thresholds are likewise meaningless. Fail fast with a clear
+    message instead of producing misleading results.
+    """
+    if top < 1:
+        console.print("[red]Error:[/] --top must be 1 or greater.")
+        raise typer.Exit(code=1)
+    if min_speed is not None and min_speed < 0:
+        console.print("[red]Error:[/] --min-speed must be 0 or greater.")
+        raise typer.Exit(code=1)
+    if min_params is not None and min_params < 0:
+        console.print("[red]Error:[/] --min-params must be 0 or greater.")
         raise typer.Exit(code=1)
 
 
@@ -87,23 +156,214 @@ def _resolve_evidence_mode(evidence: str, direct: bool) -> str:
     return mode
 
 
+def _resolve_fit_filter(fit: str, gpu_only: bool) -> str:
+    """Resolve runtime fit filtering, keeping --gpu-only as a short alias."""
+    mode = fit.lower().replace("_", "-").replace(" ", "-")
+    if mode not in {"any", "gpu", "full-gpu", "fullgpu"}:
+        console.print("[red]Error:[/] --fit must be one of: any, gpu, full-gpu.")
+        raise typer.Exit(code=1)
+    if gpu_only:
+        return "full_gpu"
+    return "full_gpu" if mode in {"gpu", "full-gpu", "fullgpu"} else "any"
+
+
+def _resolve_speed_filter(speed: str, min_speed: float | None) -> float | None:
+    """Resolve named speed presets while preserving --min-speed as exact input."""
+    if min_speed is not None:
+        return min_speed
+    mode = speed.lower().replace("_", "-")
+    presets = {
+        "any": None,
+        "usable": 10.0,
+        "fast": 30.0,
+    }
+    if mode not in presets:
+        console.print("[red]Error:[/] --speed must be one of: any, usable, fast.")
+        raise typer.Exit(code=1)
+    return presets[mode]
+
+
+_MEMORY_RE = re.compile(
+    r"^(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>gib|gb|g|mib|mb|m)?$",
+    re.IGNORECASE,
+)
+
+
+def _parse_memory_amount(
+    value: str, *, option_name: str, total_bytes: int | None = None
+) -> int:
+    """Parse memory CLI values. Bare numbers are treated as GiB."""
+    raw = value.strip()
+    if not raw:
+        console.print(f"[red]Error:[/] {option_name} cannot be empty.")
+        raise typer.Exit(code=1)
+
+    if raw.endswith("%"):
+        if total_bytes is None:
+            console.print(f"[red]Error:[/] {option_name} percentage needs a base size.")
+            raise typer.Exit(code=1)
+        try:
+            pct = float(raw[:-1])
+        except ValueError:
+            console.print(f"[red]Error:[/] Invalid {option_name}: {value!r}.")
+            raise typer.Exit(code=1)
+        if pct < 0:
+            console.print(f"[red]Error:[/] {option_name} must be non-negative.")
+            raise typer.Exit(code=1)
+        return int(total_bytes * pct / 100.0)
+
+    match = _MEMORY_RE.match(raw)
+    if not match:
+        console.print(
+            f"[red]Error:[/] Invalid {option_name}: {value!r}. "
+            "Use values like 1.5GB, 512MB, 10%, or 8."
+        )
+        raise typer.Exit(code=1)
+
+    number = float(match.group("number"))
+    unit = (match.group("unit") or "gb").lower()
+    if number < 0:
+        console.print(f"[red]Error:[/] {option_name} must be non-negative.")
+        raise typer.Exit(code=1)
+
+    if unit in {"gib", "gb", "g"}:
+        return int(number * _GiB)
+    return int(number * 1024**2)
+
+
+def _auto_vram_headroom(vram_bytes: int) -> int:
+    """Default runtime headroom so near-edge fits do not over-promise."""
+    if vram_bytes <= 0:
+        return 0
+    return int(max(512 * 1024**2, min(vram_bytes * 0.05, 2 * _GiB)))
+
+
+def _parse_vram_headroom(value: str, vram_bytes: int) -> int:
+    mode = value.strip().lower()
+    if mode == "auto":
+        return _auto_vram_headroom(vram_bytes)
+    if mode in {"none", "off", "0"}:
+        return 0
+    return _parse_memory_amount(
+        value,
+        option_name="--vram-headroom",
+        total_bytes=vram_bytes,
+    )
+
+
+def _apply_memory_budgets(
+    hardware: HardwareInfo,
+    *,
+    vram_headroom: str,
+    ram_budget: str | None,
+) -> HardwareInfo:
+    """Apply user-facing memory budgets without mutating detected raw sizes."""
+    headroom_mode = vram_headroom.strip().lower()
+    if not hardware.gpus and headroom_mode not in {"auto", "none", "off", "0"}:
+        _parse_memory_amount(
+            vram_headroom,
+            option_name="--vram-headroom",
+            total_bytes=_GiB,
+        )
+
+    reserved_values: list[int] = []
+    for gpu in hardware.gpus:
+        reserved = _parse_vram_headroom(vram_headroom, gpu.vram_bytes)
+        gpu.usable_vram_bytes = max(0, gpu.vram_bytes - reserved)
+        if reserved > 0:
+            reserved_values.append(reserved)
+
+    if reserved_values:
+        unique_reserved = sorted(set(reserved_values))
+        if len(unique_reserved) == 1:
+            note = f"VRAM headroom: {_format_budget_bytes(unique_reserved[0])} reserved per GPU"
+        else:
+            note = "VRAM headroom: auto reserve applied per GPU"
+        hardware.budget_notes.append(note)
+
+    if ram_budget:
+        mode = ram_budget.strip().lower()
+        if mode == "available":
+            from whichllm.hardware.memory import detect_available_ram_bytes
+
+            hardware.ram_budget_bytes = detect_available_ram_bytes()
+            hardware.budget_notes.append(
+                f"RAM budget: current available {_format_budget_bytes(hardware.ram_budget_bytes)}"
+            )
+        elif mode not in {"auto", "none", "off"}:
+            hardware.ram_budget_bytes = _parse_memory_amount(
+                ram_budget, option_name="--ram-budget", total_bytes=hardware.ram_bytes
+            )
+            hardware.budget_notes.append(
+                f"RAM budget: {_format_budget_bytes(hardware.ram_budget_bytes)}"
+            )
+    return hardware
+
+
+def _format_budget_bytes(value: int) -> str:
+    if value >= _GiB:
+        return f"{value / _GiB:.1f} GB"
+    if value >= 1024**2:
+        return f"{value / 1024**2:.0f} MB"
+    return f"{value / 1024:.0f} KB"
+
+
 def _apply_gpu_overrides(
     hardware: HardwareInfo,
     cpu_only: bool,
-    gpu: str | None,
+    gpu: list[str] | None,
     vram: float | None,
+    bandwidth: float | None = None,
+    gpu_index: int | None = None,
 ) -> HardwareInfo:
     """Replace hardware.gpus based on CLI flags."""
     if cpu_only:
         hardware.gpus = []
     elif gpu:
-        from whichllm.hardware.gpu_simulator import create_synthetic_gpu
+        from whichllm.hardware.gpu_simulator import create_synthetic_gpus
 
         try:
-            hardware.gpus = [create_synthetic_gpu(gpu, vram)]
+            hardware.gpus = create_synthetic_gpus(gpu, vram)
         except ValueError as e:
             console.print(f"[red]Error:[/] {e}")
             raise typer.Exit(code=1)
+        if bandwidth is not None:
+            if len(hardware.gpus) != 1:
+                console.print(
+                    "[red]Error:[/] --bandwidth currently supports exactly one "
+                    "simulated GPU."
+                )
+                raise typer.Exit(code=1)
+            hardware.gpus[0].memory_bandwidth_gbps = bandwidth
+    elif vram is not None or bandwidth is not None:
+        if not hardware.gpus:
+            console.print(
+                "[red]Error:[/] --vram/--bandwidth requires a detected GPU or --gpu."
+            )
+            raise typer.Exit(code=1)
+        if gpu_index is None:
+            if len(hardware.gpus) > 1:
+                console.print(
+                    "[red]Error:[/] --gpu-index is required when overriding "
+                    "detected hardware with multiple GPUs."
+                )
+                raise typer.Exit(code=1)
+            target_gpu = hardware.gpus[0]
+        else:
+            if gpu_index >= len(hardware.gpus):
+                console.print(
+                    f"[red]Error:[/] --gpu-index {gpu_index} is out of range "
+                    f"for {len(hardware.gpus)} detected GPU(s)."
+                )
+                raise typer.Exit(code=1)
+            target_gpu = hardware.gpus[gpu_index]
+
+        if vram is not None:
+            target_gpu.vram_bytes = int(vram * _GiB)
+            target_gpu.usable_vram_bytes = None
+            target_gpu.vram_overridden = True
+        if bandwidth is not None:
+            target_gpu.memory_bandwidth_gbps = bandwidth
     return hardware
 
 
@@ -118,9 +378,18 @@ def _auto_min_params_for_profile(hardware: HardwareInfo, profile: str) -> float 
         return None
     if not hardware.gpus:
         return 2.0  # CPU-only: tiny is the only practical choice
-    usable_ram = int(hardware.ram_bytes * 0.80)
+    from whichllm.hardware.memory import effective_usable_ram
+
+    usable_ram = effective_usable_ram(hardware.ram_bytes, hardware.ram_budget_bytes)
     best_vram_gb = max(
-        (usable_ram if g.shared_memory and g.vram_bytes == 0 else g.vram_bytes)
+        (
+            usable_ram
+            if g.shared_memory
+            and (g.vram_bytes == 0 or hardware.ram_budget_bytes is not None)
+            else (
+                g.usable_vram_bytes if g.usable_vram_bytes is not None else g.vram_bytes
+            )
+        )
         for g in hardware.gpus
     ) / (1024**3)
     if best_vram_gb >= 30:
@@ -199,13 +468,32 @@ def main(
     ),
     top: int = typer.Option(10, "--top", "-n", help="Number of top models to show"),
     context_length: int = typer.Option(
-        4096, "--context-length", "-c", help="Context length for KV cache estimation"
+        4096,
+        "--context-length",
+        "-c",
+        click_type=CONTEXT_LENGTH,
+        help="Context length for KV cache estimation (e.g. 4096, 64k, 128k)",
     ),
     quant: Optional[str] = typer.Option(
         None, "--quant", "-q", help="Filter by quantization type (e.g. Q4_K_M)"
     ),
     min_speed: Optional[float] = typer.Option(
-        None, "--min-speed", help="Minimum tok/s filter"
+        None, "--min-speed", help="Exact minimum tok/s filter"
+    ),
+    speed: str = typer.Option(
+        "any",
+        "--speed",
+        help="Speed preset filter: any | usable | fast",
+    ),
+    fit: str = typer.Option(
+        "any",
+        "--fit",
+        help="Runtime fit filter: any | gpu | full-gpu",
+    ),
+    gpu_only: bool = typer.Option(
+        False,
+        "--gpu-only",
+        help="Only show models that fit fully in GPU VRAM",
     ),
     evidence: str = typer.Option(
         "any",
@@ -220,7 +508,12 @@ def main(
     status: bool = typer.Option(
         False,
         "--status",
-        help="Show runtime status columns (Speed/Fit) in ranking table",
+        help="Show runtime columns (default; kept for compatibility)",
+    ),
+    details: bool = typer.Option(
+        False,
+        "--details",
+        help="Show Downloads metadata instead of runtime columns",
     ),
     min_params: Optional[float] = typer.Option(
         None,
@@ -233,23 +526,58 @@ def main(
         help="Ranking profile: general | coding | vision | math | any",
     ),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    markdown_output: bool = typer.Option(
+        False,
+        "--markdown",
+        "-m",
+        help="Output as GitHub-Flavored Markdown",
+    ),
     cpu_only: bool = typer.Option(
         False, "--cpu-only", help="Ignore GPU and run in CPU-only mode"
     ),
-    gpu: Optional[str] = typer.Option(
-        None, "--gpu", help="Simulate a GPU (e.g. 'RTX 4090')"
+    gpu: Optional[list[str]] = typer.Option(
+        None,
+        "--gpu",
+        help="Simulate GPU(s), e.g. 'RTX 4090', '2x RTX 4090', or repeat --gpu",
     ),
     vram: Optional[float] = typer.Option(
-        None, "--vram", help="Override VRAM in GB (requires --gpu)"
+        None,
+        "--vram",
+        help="Override simulated GPU VRAM or detected GPU usable VRAM in GB",
+    ),
+    bandwidth: Optional[float] = typer.Option(
+        None,
+        "--bandwidth",
+        "--ram-bandwidth",
+        help="Override GPU/RAM bandwidth in GB/s",
+    ),
+    gpu_index: Optional[int] = typer.Option(
+        None,
+        "--gpu-index",
+        help="Detected GPU index to override when multiple GPUs are present",
+    ),
+    vram_headroom: str = typer.Option(
+        "auto",
+        "--vram-headroom",
+        help="Reserve GPU memory for runtime overhead: auto | none | 1GB | 10%",
+    ),
+    ram_budget: Optional[str] = typer.Option(
+        None,
+        "--ram-budget",
+        help="RAM budget for offload: available | 8GB | 50%",
     ),
 ):
     """Detect hardware and recommend the best local LLMs."""
     if ctx.invoked_subcommand is not None:
         return
 
-    _validate_gpu_flags(cpu_only, gpu, vram)
+    _validate_gpu_flags(cpu_only, gpu, vram, bandwidth, gpu_index)
+    _validate_output_flags(json_output, markdown_output)
+    _validate_ranking_flags(top, min_speed, min_params)
     profile = _validate_profile(profile)
     evidence_mode = _resolve_evidence_mode(evidence, direct)
+    fit_filter = _resolve_fit_filter(fit, gpu_only)
+    speed_filter = _resolve_speed_filter(speed, min_speed)
 
     from rich.progress import Progress, SpinnerColumn, TextColumn
 
@@ -268,7 +596,12 @@ def main(
         models_to_dicts,
     )
     from whichllm.models.grouper import group_models
-    from whichllm.output.display import display_hardware, display_json, display_ranking
+    from whichllm.output.display import (
+        display_hardware,
+        display_json,
+        display_markdown,
+        display_ranking,
+    )
 
     with Progress(
         SpinnerColumn(),
@@ -279,7 +612,10 @@ def main(
         # Step 1: Detect hardware
         task = progress.add_task("Detecting hardware...", total=None)
         hardware = detect_hardware()
-        _apply_gpu_overrides(hardware, cpu_only, gpu, vram)
+        _apply_gpu_overrides(hardware, cpu_only, gpu, vram, bandwidth, gpu_index)
+        _apply_memory_budgets(
+            hardware, vram_headroom=vram_headroom, ram_budget=ram_budget
+        )
         progress.update(task, description="Hardware detected")
 
         # Step 2: Fetch models
@@ -297,7 +633,9 @@ def main(
                 save_cache(models_to_dicts(models))
                 progress.update(task, description=f"Fetched {len(models)} models")
             except Exception as e:
-                console.print(f"[red]Error fetching models:[/] {e}")
+                console.print(
+                    f"[red]Error fetching models:[/] {_format_fetch_error(e)}"
+                )
                 sys.exit(1)
 
         # Step 3: Fetch benchmark scores
@@ -306,7 +644,7 @@ def main(
         if bench_scores is None:
             try:
                 progress.update(task, description="Fetching benchmark scores...")
-                bench_scores = fetch_benchmark_scores()
+                bench_scores = _run_async(fetch_benchmark_scores())
                 save_benchmark_cache(bench_scores)
             except Exception as e:
                 console.print(f"[yellow]Warning:[/] Benchmark data unavailable: {e}")
@@ -340,12 +678,13 @@ def main(
             context_length=context_length,
             top_n=top,
             quant_filter=quant,
-            min_speed=min_speed,
+            min_speed=speed_filter,
             benchmark_scores=bench_scores,
             task_profile=profile,
             require_direct_top=True,
             min_params_b=auto_min_params,
             evidence_filter=evidence_mode,
+            fit_filter=fit_filter,
         )
 
         # 自動しきい値で候補ゼロなら緩和して表示を維持する
@@ -356,16 +695,18 @@ def main(
                 context_length=context_length,
                 top_n=top,
                 quant_filter=quant,
-                min_speed=min_speed,
+                min_speed=speed_filter,
                 benchmark_scores=bench_scores,
                 task_profile=profile,
                 require_direct_top=True,
                 min_params_b=None,
                 evidence_filter=evidence_mode,
+                fit_filter=fit_filter,
             )
 
         # 上位候補の公開日時が欠けている場合のみ補完して表示品質を上げる
         if results:
+            attach_resolved_artifacts(results, all_models, quant_filter=quant)
             try:
                 if _fill_missing_published_at(
                     all_models, results, fetch_model_published_at
@@ -377,13 +718,32 @@ def main(
                 )
 
     # Display results
+    empty_message = None
+    if fit_filter == "full_gpu":
+        empty_message = (
+            "No full-GPU models found for this hardware. "
+            "Remove --gpu-only or use --fit any to include partial offload "
+            "and CPU-only candidates."
+        )
     if json_output:
         display_json(results, hardware)
+    elif markdown_output:
+        display_markdown(
+            results,
+            hardware,
+            show_status=status or not details,
+            empty_message=empty_message,
+        )
     else:
         console.print()
         display_hardware(hardware)
         console.print()
-        display_ranking(results, has_gpu=bool(hardware.gpus), show_status=status)
+        display_ranking(
+            results,
+            has_gpu=bool(hardware.gpus),
+            show_status=status or not details,
+            empty_message=empty_message,
+        )
         console.print()
 
 
@@ -391,7 +751,11 @@ def main(
 def plan(
     model_name: str = typer.Argument(..., help="Model name or HuggingFace repo ID"),
     context_length: int = typer.Option(
-        4096, "--context-length", "-c", help="Context length for KV cache estimation"
+        4096,
+        "--context-length",
+        "-c",
+        click_type=CONTEXT_LENGTH,
+        help="Context length for KV cache estimation (e.g. 4096, 64k, 128k)",
     ),
     quant: Optional[str] = typer.Option(
         None, "--quant", "-q", help="Target quantization (default: Q4_K_M)"
@@ -424,7 +788,9 @@ def plan(
                 models = _run_async(fetch_models(include_vision=True))
                 save_cache(models_to_dicts(models))
             except Exception as e:
-                console.print(f"[red]Error fetching models:[/] {e}")
+                console.print(
+                    f"[red]Error fetching models:[/] {_format_fetch_error(e)}"
+                )
                 sys.exit(1)
 
     model = _search_model(models, model_name)
@@ -446,7 +812,11 @@ def upgrade(
         help="GPUs to compare against (e.g. 'RTX 4090' 'RTX 5090' 'H100')",
     ),
     context_length: int = typer.Option(
-        8192, "--context-length", "-c", help="Context length for ranking"
+        8192,
+        "--context-length",
+        "-c",
+        click_type=CONTEXT_LENGTH,
+        help="Context length for ranking (e.g. 8192, 64k, 128k)",
     ),
     top: int = typer.Option(3, "--top", "-n", help="Best-N models to compare per GPU"),
     profile: str = typer.Option("general", "--profile", help="Ranking profile"),
@@ -481,6 +851,7 @@ def upgrade(
     from whichllm.output.display import display_upgrade, display_upgrade_json
 
     profile = _validate_profile(profile)
+    _validate_ranking_flags(top, None, None)
 
     with Progress(
         SpinnerColumn(),
@@ -503,14 +874,16 @@ def upgrade(
                 models = _run_async(fetch_models(include_vision=False))
                 save_cache(models_to_dicts(models))
             except Exception as e:
-                console.print(f"[red]Error fetching models:[/] {e}")
+                console.print(
+                    f"[red]Error fetching models:[/] {_format_fetch_error(e)}"
+                )
                 raise typer.Exit(code=1)
 
         progress.update(task, description="Loading benchmark data...")
         bench_scores = None if refresh else load_benchmark_cache()
         if bench_scores is None:
             try:
-                bench_scores = fetch_benchmark_scores()
+                bench_scores = _run_async(fetch_benchmark_scores())
                 save_benchmark_cache(bench_scores)
             except Exception:
                 bench_scores = {}
@@ -590,20 +963,87 @@ def _load_models(refresh: bool, include_vision: bool = True):
         save_cache(models_to_dicts(models))
         return models
     except Exception as e:
-        console.print(f"[red]Error fetching models:[/] {e}")
+        console.print(f"[red]Error fetching models:[/] {_format_fetch_error(e)}")
         sys.exit(1)
+
+
+_SIZE_TOKEN_RE = re.compile(r"^(\d+(?:\.\d+)?)([bm])$", re.IGNORECASE)
+
+
+def _parse_size_tokens(
+    terms: list[str],
+) -> tuple[list[str], float | None]:
+    """Split query terms into non-size terms and an optional size in billions.
+
+    Returns (remaining_terms, size_b) where size_b is None if no size token
+    was found.  Only the first size token is used; subsequent size tokens are
+    kept as plain text terms.  Handles 'b' (billions) and 'm' (millions).
+    """
+    remaining = []
+    size_b: float | None = None
+    for t in terms:
+        m = _SIZE_TOKEN_RE.match(t)
+        if m and size_b is None:
+            value = float(m.group(1))
+            if value <= 0:
+                remaining.append(t)
+                continue
+            unit = m.group(2).lower()
+            size_b = value if unit == "b" else value / 1000.0
+        else:
+            remaining.append(t)
+    return remaining, size_b
+
+
+_ID_SIZE_RE = re.compile(r"(?:^|[-_/])(\d+(?:\.\d+)?)(b|m)(?:[-_.]|$)", re.IGNORECASE)
+
+
+def _extract_id_size_b(model_id: str) -> float | None:
+    """Extract the size label from a model ID string, in billions.
+
+    Scans for patterns like '7B', '1.7B', '500M' at word boundaries in the
+    model ID.  Returns the first match converted to billions, or None.
+    """
+    for m in _ID_SIZE_RE.finditer(model_id):
+        value = float(m.group(1))
+        if value <= 0:
+            continue
+        unit = m.group(2).lower()
+        return value if unit == "b" else value / 1000.0
+    return None
+
+
+def _size_compatible(model: ModelInfo, size_b: float) -> bool:
+    """Check whether a model's parameter count is compatible with a query size.
+
+    Uses a tolerance band of [0.7x, 1.5x] to accommodate rounding differences
+    (e.g. a 7B query matching a model with 7.6B actual parameters) while
+    rejecting adjacent model sizes (e.g. 7B vs 4B or 12B).
+    """
+    if model.parameter_count <= 0:
+        return True
+    actual_b = model.parameter_count / 1e9
+    ratio = actual_b / size_b
+    return 0.7 <= ratio <= 1.5
 
 
 def _search_model(models: list, model_name: str):
     """Search for a model by name/ID. Returns single model or exits."""
     query_lower = model_name.lower()
     terms = query_lower.split()
+    size_b = None
 
     matches = [m for m in models if m.id.lower() == query_lower]
     if not matches:
         matches = [m for m in models if m.id.lower().endswith("/" + query_lower)]
     if not matches:
-        matches = [m for m in models if all(t in m.id.lower() for t in terms)]
+        text_terms, size_b = _parse_size_tokens(terms)
+        matches = [
+            m
+            for m in models
+            if all(t in m.id.lower() for t in text_terms)
+            and (size_b is None or _size_compatible(m, size_b))
+        ]
 
     if not matches:
         console.print(f"[red]No model found matching '{model_name}'.[/]")
@@ -620,7 +1060,27 @@ def _search_model(models: list, model_name: str):
                 console.print(f"  • {m.id} ({p})")
         raise typer.Exit(code=1)
 
-    matches.sort(key=lambda m: m.downloads, reverse=True)
+    if size_b is not None:
+
+        def _sort_key(m: ModelInfo) -> tuple:
+            id_size = _extract_id_size_b(m.id)
+            has_id_size = id_size is not None
+            id_dist = abs(id_size - size_b) if has_id_size else float("inf")
+            pc_dist = (
+                abs(m.parameter_count / 1e9 - size_b)
+                if m.parameter_count > 0
+                else float("inf")
+            )
+            return (
+                0 if (has_id_size or m.parameter_count > 0) else 1,
+                id_dist,
+                pc_dist,
+                -m.downloads,
+            )
+
+        matches.sort(key=_sort_key)
+    else:
+        matches.sort(key=lambda m: m.downloads, reverse=True)
     model = matches[0]
     if len(matches) > 1:
         console.print(f"[dim]Found {len(matches)} matches, using: {model.id}[/]")
@@ -650,81 +1110,6 @@ def _pick_gguf_variant(model, quant_filter: str | None = None):
     return model.gguf_variants[0]
 
 
-def _find_gguf_variant(model: ModelInfo, quant_type: str) -> GGUFVariant | None:
-    for variant in model.gguf_variants:
-        if variant.quant_type.upper() == quant_type.upper():
-            return variant
-    return None
-
-
-def _is_same_model_family(candidate: ModelInfo, selected: ModelInfo) -> bool:
-    if candidate.id == selected.id:
-        return True
-    if candidate.family_id and selected.family_id:
-        if candidate.family_id == selected.family_id:
-            return True
-    if candidate.base_model and candidate.base_model == selected.id:
-        return True
-    if selected.base_model and selected.base_model == candidate.id:
-        return True
-    if candidate.base_model and selected.base_model:
-        return candidate.base_model == selected.base_model
-    return False
-
-
-def _has_compatible_parameter_count(candidate: ModelInfo, selected: ModelInfo) -> bool:
-    if candidate.parameter_count <= 0 or selected.parameter_count <= 0:
-        return True
-    smaller = min(candidate.parameter_count, selected.parameter_count)
-    larger = max(candidate.parameter_count, selected.parameter_count)
-    return (larger / smaller) <= 2.0
-
-
-def _resolve_ranked_gguf_for_run(
-    selected_model: ModelInfo,
-    selected_variant: GGUFVariant,
-    models: list[ModelInfo],
-    quant_filter: str | None = None,
-) -> tuple[ModelInfo, GGUFVariant] | None:
-    """Resolve a ranked GGUF candidate to a real GGUF repo/file for `run`.
-
-    The ranker may synthesize GGUF variants for official safetensors-only repos
-    so they can be scored realistically. `run` cannot execute those synthetic
-    files directly, so it must find a real GGUF sibling before launching.
-    """
-    desired_quant = quant_filter or selected_variant.quant_type
-
-    if selected_model.gguf_variants:
-        variant = _find_gguf_variant(selected_model, desired_quant)
-        return (selected_model, variant) if variant else None
-
-    candidates: list[tuple[bool, int, int, ModelInfo, GGUFVariant]] = []
-    for model in models:
-        if not model.gguf_variants or not _is_same_model_family(model, selected_model):
-            continue
-        if not _has_compatible_parameter_count(model, selected_model):
-            continue
-        variant = _find_gguf_variant(model, desired_quant)
-        if not variant:
-            continue
-        explicit_base = model.base_model == selected_model.id
-        candidates.append(
-            (
-                explicit_base,
-                model.downloads,
-                model.likes,
-                model,
-                variant,
-            )
-        )
-
-    if not candidates:
-        return None
-
-    _, _, _, model, variant = max(candidates, key=lambda item: item[:3])
-    return model, variant
-
-
 def _resolve_model_deps(model, variant) -> tuple[list[str], str]:
     """Determine pip dependencies and script type for a model.
 
@@ -748,12 +1133,15 @@ def _generate_chat_script(model, variant, context_length: int, cpu_only: bool) -
     """Generate a self-contained Python chat script for any model type."""
     if variant:
         n_gpu = 0 if cpu_only else -1
-        return f'''\
+        return f"""\
 from huggingface_hub import hf_hub_download
 from llama_cpp import Llama
 
-print("Downloading {model.id} ({variant.quant_type})...")
-model_path = hf_hub_download(repo_id="{model.id}", filename="{variant.filename}")
+model_id = {model.id!r}
+filename = {variant.filename!r}
+quant_type = {variant.quant_type!r}
+print(f"Downloading {{model_id}} ({{quant_type}})...")
+model_path = hf_hub_download(repo_id=model_id, filename=filename)
 print("Loading model...")
 llm = Llama(
     model_path=model_path,
@@ -784,54 +1172,70 @@ while True:
     print()
     messages.append({{"role": "assistant", "content": full}})
 print("\\nBye!")
-'''
+"""
 
     device_map = '"cpu"' if cpu_only else '"auto"'
     dtype = "torch.float32" if cpu_only else '"auto"'
-    return f'''\
+    return f"""\
+import shutil
+import tempfile
 import torch
 from threading import Thread
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
-model_id = "{model.id}"
-print(f"Loading {{model_id}}...")
-tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(
-    model_id, device_map={device_map}, torch_dtype={dtype}, trust_remote_code=True,
-)
-print("Ready! Type 'exit' to quit.\\n")
-messages = []
-while True:
-    try:
-        user_input = input("> ")
-    except (KeyboardInterrupt, EOFError):
-        break
-    if user_input.strip().lower() in ("exit", "quit", "q"):
-        break
-    if not user_input.strip():
-        continue
-    messages.append({{"role": "user", "content": user_input}})
-    inputs = tokenizer.apply_chat_template(
-        messages,
-        return_tensors="pt",
-        return_dict=True,
-        add_generation_prompt=True,
-    ).to(model.device)
-    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-    thread = Thread(
-        target=model.generate,
-        kwargs=dict(**inputs, max_new_tokens=512, streamer=streamer),
+model_id = {model.id!r}
+offload_folder = tempfile.mkdtemp(prefix="whichllm_transformers_offload_")
+try:
+    print(f"Loading {{model_id}}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        device_map={device_map},
+        torch_dtype={dtype},
+        trust_remote_code=True,
+        offload_folder=offload_folder,
     )
-    thread.start()
-    full = ""
-    for text in streamer:
-        print(text, end="", flush=True)
-        full += text
-    thread.join()
-    print()
-    messages.append({{"role": "assistant", "content": full}})
-print("\\nBye!")
-'''
+    print("Ready! Type 'exit' to quit.\\n")
+    messages = []
+    while True:
+        try:
+            user_input = input("> ")
+        except (KeyboardInterrupt, EOFError):
+            break
+        if user_input.strip().lower() in ("exit", "quit", "q"):
+            break
+        if not user_input.strip():
+            continue
+        messages.append({{"role": "user", "content": user_input}})
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            return_tensors="pt",
+            return_dict=True,
+            add_generation_prompt=True,
+        ).to(model.device)
+        streamer = TextIteratorStreamer(
+            tokenizer, skip_prompt=True, skip_special_tokens=True
+        )
+        thread = Thread(
+            target=model.generate,
+            kwargs=dict(**inputs, max_new_tokens=512, streamer=streamer),
+        )
+        thread.start()
+        full = ""
+        for text in streamer:
+            print(text, end="", flush=True)
+            full += text
+        thread.join()
+        print()
+        messages.append({{"role": "assistant", "content": full}})
+    print("\\nBye!")
+finally:
+    try:
+        del model
+    except NameError:
+        pass
+    shutil.rmtree(offload_folder, ignore_errors=True)
+"""
 
 
 @app.command()
@@ -840,7 +1244,11 @@ def run(
         None, help="Model to run (default: auto-pick best)"
     ),
     context_length: int = typer.Option(
-        4096, "--context-length", "-c", help="Context length"
+        4096,
+        "--context-length",
+        "-c",
+        click_type=CONTEXT_LENGTH,
+        help="Context length (e.g. 4096, 64k, 128k)",
     ),
     quant: Optional[str] = typer.Option(
         None, "--quant", "-q", help="Quantization type"
@@ -907,7 +1315,7 @@ def run(
         model = None
         for ranked in results:
             if ranked.gguf_variant:
-                resolved = _resolve_ranked_gguf_for_run(
+                resolved = resolve_ranked_gguf_artifact(
                     ranked.model,
                     ranked.gguf_variant,
                     all_models,
@@ -1009,12 +1417,12 @@ def snippet(
     deps, _ = _resolve_model_deps(model, variant)
 
     if variant:
-        code = f'''\
+        code = f"""\
 from llama_cpp import Llama
 
 llm = Llama.from_pretrained(
-    repo_id="{model.id}",
-    filename="{variant.filename}",
+    repo_id={model.id!r},
+    filename={variant.filename!r},
     n_ctx=4096,
     n_gpu_layers=-1,  # -1 = all layers on GPU, 0 = CPU only
     verbose=False,
@@ -1024,12 +1432,12 @@ output = llm.create_chat_completion(
     messages=[{{"role": "user", "content": "Hello!"}}],
 )
 print(output["choices"][0]["message"]["content"])
-'''
+"""
     else:
-        code = f'''\
+        code = f"""\
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model_id = "{model.id}"
+model_id = {model.id!r}
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(
     model_id, device_map="auto", torch_dtype="auto", trust_remote_code=True,
@@ -1038,7 +1446,7 @@ model = AutoModelForCausalLM.from_pretrained(
 inputs = tokenizer("Hello!", return_tensors="pt").to(model.device)
 outputs = model.generate(**inputs, max_new_tokens=256)
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
-'''
+"""
 
     dep_str = " ".join(f"--with {d}" for d in deps)
     console.print(f"\n[bold]{model.id}[/]")
@@ -1052,15 +1460,30 @@ def hardware(
     cpu_only: bool = typer.Option(
         False, "--cpu-only", help="Ignore GPU and run in CPU-only mode"
     ),
-    gpu: Optional[str] = typer.Option(
-        None, "--gpu", help="Simulate a GPU (e.g. 'RTX 4090')"
+    gpu: Optional[list[str]] = typer.Option(
+        None,
+        "--gpu",
+        help="Simulate GPU(s), e.g. 'RTX 4090', '2x RTX 4090', or repeat --gpu",
     ),
     vram: Optional[float] = typer.Option(
-        None, "--vram", help="Override VRAM in GB (requires --gpu)"
+        None,
+        "--vram",
+        help="Override simulated GPU VRAM or detected GPU usable VRAM in GB",
+    ),
+    bandwidth: Optional[float] = typer.Option(
+        None,
+        "--bandwidth",
+        "--ram-bandwidth",
+        help="Override GPU/RAM bandwidth in GB/s",
+    ),
+    gpu_index: Optional[int] = typer.Option(
+        None,
+        "--gpu-index",
+        help="Detected GPU index to override when multiple GPUs are present",
     ),
 ):
     """Show detected hardware information only."""
-    _validate_gpu_flags(cpu_only, gpu, vram)
+    _validate_gpu_flags(cpu_only, gpu, vram, bandwidth, gpu_index)
 
     from rich.progress import Progress, SpinnerColumn, TextColumn
 
@@ -1075,7 +1498,7 @@ def hardware(
     ) as progress:
         task = progress.add_task("Detecting hardware...", total=None)
         hw = detect_hardware()
-        _apply_gpu_overrides(hw, cpu_only, gpu, vram)
+        _apply_gpu_overrides(hw, cpu_only, gpu, vram, bandwidth, gpu_index)
         progress.remove_task(task)
 
     console.print()

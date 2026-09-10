@@ -1,23 +1,35 @@
 """Tests for CLI helper logic."""
 
+import ast
+
+import httpx
 import pytest
-from click.exceptions import Exit
+from typer import Exit
 
 import whichllm.cli as cli_mod
+import whichllm.__main__ as main_mod
 from whichllm.cli import (
+    _apply_memory_budgets,
+    _apply_gpu_overrides,
     _auto_min_params_for_profile,
-    _current_version,
+    _extract_id_size_b,
     _fill_missing_published_at,
+    _format_fetch_error,
     _generate_chat_script,
     _include_vision_candidates,
     _merge_model_eval_benchmarks,
+    _parse_memory_amount,
     _pick_gguf_variant,
     _resolve_ranked_gguf_for_run,
     _resolve_evidence_mode,
+    _resolve_fit_filter,
+    _resolve_speed_filter,
     _search_model,
     _validate_evidence,
+    _validate_gpu_flags,
     app,
 )
+from whichllm.utils import _current_version
 from whichllm.engine.types import CompatibilityResult
 from whichllm.hardware.types import GPUInfo, HardwareInfo
 from whichllm.models.types import GGUFVariant, ModelInfo
@@ -58,6 +70,160 @@ def test_auto_min_params_non_general_disabled():
     assert _auto_min_params_for_profile(_hw_with_gpu(24), "coding") is None
 
 
+def test_auto_min_params_uses_usable_vram_budget():
+    hw = _hw_with_gpu(20)
+    hw.gpus[0].usable_vram_bytes = int(19.0 * 1024**3)
+
+    assert _auto_min_params_for_profile(hw, "general") == 8.0
+
+
+def test_auto_min_params_uses_ram_budget_for_shared_memory_gpu():
+    hw = HardwareInfo(
+        gpus=[
+            GPUInfo(
+                name="Apple M2",
+                vendor="apple",
+                vram_bytes=16 * 1024**3,
+                usable_vram_bytes=15 * 1024**3,
+                shared_memory=True,
+            )
+        ],
+        ram_bytes=16 * 1024**3,
+        ram_budget_bytes=4 * 1024**3,
+    )
+
+    assert _auto_min_params_for_profile(hw, "general") == 2.0
+
+
+def test_apply_gpu_overrides_accepts_multiple_simulated_gpus():
+    hw = HardwareInfo(gpus=[], ram_bytes=64 * 1024**3, os="linux")
+
+    _apply_gpu_overrides(hw, cpu_only=False, gpu=["2x RTX 4090"], vram=None)
+
+    assert len(hw.gpus) == 2
+    assert all(gpu.vendor == "nvidia" for gpu in hw.gpus)
+    assert all(gpu.vram_bytes == 24 * 1024**3 for gpu in hw.gpus)
+
+
+def test_validate_gpu_flags_allows_detected_vram_override():
+    _validate_gpu_flags(cpu_only=False, gpu=None, vram=8.0, bandwidth=None)
+
+
+def test_validate_gpu_flags_rejects_non_positive_overrides():
+    with pytest.raises(Exit):
+        _validate_gpu_flags(cpu_only=False, gpu=None, vram=0, bandwidth=None)
+    with pytest.raises(Exit):
+        _validate_gpu_flags(cpu_only=False, gpu=None, vram=None, bandwidth=-1)
+
+
+def test_validate_gpu_flags_rejects_gpu_index_with_simulated_gpu():
+    with pytest.raises(Exit):
+        _validate_gpu_flags(
+            cpu_only=False,
+            gpu=["RTX 4090"],
+            vram=24.0,
+            bandwidth=None,
+            gpu_index=0,
+        )
+
+
+def test_apply_gpu_overrides_updates_detected_shared_memory_gpu():
+    hw = HardwareInfo(
+        gpus=[
+            GPUInfo(
+                name="Intel UHD Graphics",
+                vendor="intel",
+                vram_bytes=0,
+                shared_memory=True,
+                memory_bandwidth_gbps=None,
+            )
+        ],
+        cpu_name="CPU",
+        cpu_cores=8,
+        ram_bytes=32 * 1024**3,
+        disk_free_bytes=100 * 1024**3,
+        os="linux",
+    )
+
+    _apply_gpu_overrides(hw, cpu_only=False, gpu=None, vram=6.0, bandwidth=88.5)
+
+    assert hw.gpus[0].vram_bytes == 6 * 1024**3
+    assert hw.gpus[0].usable_vram_bytes is None
+    assert hw.gpus[0].memory_bandwidth_gbps == 88.5
+    assert hw.gpus[0].shared_memory is True
+    assert hw.gpus[0].vram_overridden is True
+
+
+def test_apply_gpu_overrides_updates_selected_detected_gpu_only():
+    hw = HardwareInfo(
+        gpus=[
+            GPUInfo(
+                name="NVIDIA RTX 4060",
+                vendor="nvidia",
+                vram_bytes=8 * 1024**3,
+                memory_bandwidth_gbps=272.0,
+            ),
+            GPUInfo(
+                name="Intel UHD Graphics",
+                vendor="intel",
+                vram_bytes=0,
+                shared_memory=True,
+            ),
+        ],
+        cpu_name="CPU",
+        cpu_cores=8,
+        ram_bytes=32 * 1024**3,
+        disk_free_bytes=100 * 1024**3,
+        os="linux",
+    )
+
+    _apply_gpu_overrides(
+        hw, cpu_only=False, gpu=None, vram=4.0, bandwidth=60.0, gpu_index=1
+    )
+
+    assert hw.gpus[0].vram_bytes == 8 * 1024**3
+    assert hw.gpus[0].memory_bandwidth_gbps == 272.0
+    assert hw.gpus[1].vram_bytes == 4 * 1024**3
+    assert hw.gpus[1].memory_bandwidth_gbps == 60.0
+    assert hw.gpus[1].vram_overridden is True
+
+
+def test_apply_gpu_overrides_requires_gpu_index_for_multiple_detected_gpus():
+    hw = HardwareInfo(
+        gpus=[
+            GPUInfo(name="GPU 0", vendor="nvidia", vram_bytes=8 * 1024**3),
+            GPUInfo(name="GPU 1", vendor="intel", vram_bytes=0, shared_memory=True),
+        ],
+        cpu_name="CPU",
+        cpu_cores=8,
+        ram_bytes=32 * 1024**3,
+        disk_free_bytes=100 * 1024**3,
+        os="linux",
+    )
+
+    with pytest.raises(Exit):
+        _apply_gpu_overrides(hw, cpu_only=False, gpu=None, vram=4.0)
+
+
+def test_apply_gpu_overrides_updates_simulated_gpu_bandwidth():
+    hw = HardwareInfo(gpus=[], ram_bytes=32 * 1024**3, os="linux")
+
+    _apply_gpu_overrides(
+        hw, cpu_only=False, gpu=["Unknown GPU"], vram=4.0, bandwidth=72.0
+    )
+
+    assert len(hw.gpus) == 1
+    assert hw.gpus[0].vram_bytes == 4 * 1024**3
+    assert hw.gpus[0].memory_bandwidth_gbps == 72.0
+
+
+def test_apply_gpu_overrides_rejects_override_without_gpu():
+    hw = HardwareInfo(gpus=[], ram_bytes=32 * 1024**3, os="linux")
+
+    with pytest.raises(Exit):
+        _apply_gpu_overrides(hw, cpu_only=False, gpu=None, vram=4.0)
+
+
 def test_include_vision_candidates_by_profile():
     assert _include_vision_candidates("vision") is True
     assert _include_vision_candidates("any") is True
@@ -96,6 +262,30 @@ def test_version_option_prints_version_and_exits():
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert _current_version() in result.stdout
+
+
+def test_module_entrypoint_uses_cli_app():
+    assert main_mod.app is app
+
+
+def test_format_fetch_error_uses_exception_class_when_message_is_empty():
+    class EmptyNetworkError(Exception):
+        def __str__(self) -> str:
+            return ""
+
+    assert _format_fetch_error(EmptyNetworkError()) == (
+        "EmptyNetworkError with no detail from the network layer"
+    )
+
+
+def test_format_fetch_error_includes_status_and_url_for_empty_http_error():
+    request = httpx.Request("GET", "https://huggingface.co/api/models")
+    response = httpx.Response(429, request=request)
+    error = httpx.HTTPStatusError("", request=request, response=response)
+
+    assert _format_fetch_error(error) == (
+        "HTTPStatusError: HTTP 429 for https://huggingface.co/api/models"
+    )
 
 
 def test_merge_model_eval_benchmarks_is_now_a_noop():
@@ -150,10 +340,323 @@ def test_resolve_evidence_mode_direct_alias_wins():
     assert _resolve_evidence_mode("base", direct=True) == "strict"
 
 
+def test_resolve_fit_filter_accepts_gpu_only_alias():
+    assert _resolve_fit_filter("any", gpu_only=False) == "any"
+    assert _resolve_fit_filter("gpu", gpu_only=False) == "full_gpu"
+    assert _resolve_fit_filter("full-gpu", gpu_only=False) == "full_gpu"
+    assert _resolve_fit_filter("full_gpu", gpu_only=False) == "full_gpu"
+    assert _resolve_fit_filter("any", gpu_only=True) == "full_gpu"
+
+
+def test_resolve_fit_filter_rejects_unknown_mode():
+    with pytest.raises(Exit):
+        _resolve_fit_filter("partial", gpu_only=False)
+
+
+def test_resolve_speed_filter_presets_and_min_speed_override():
+    assert _resolve_speed_filter("any", min_speed=None) is None
+    assert _resolve_speed_filter("usable", min_speed=None) == 10.0
+    assert _resolve_speed_filter("fast", min_speed=None) == 30.0
+    assert _resolve_speed_filter("fast", min_speed=2.5) == 2.5
+
+
+def test_resolve_speed_filter_rejects_unknown_mode():
+    with pytest.raises(Exit):
+        _resolve_speed_filter("slowish", min_speed=None)
+
+
+def test_parse_memory_amount_supports_gb_mb_and_percent():
+    assert _parse_memory_amount("1.5GB", option_name="--x") == int(1.5 * 1024**3)
+    assert _parse_memory_amount("512MB", option_name="--x") == 512 * 1024**2
+    assert _parse_memory_amount("8", option_name="--x") == 8 * 1024**3
+    assert (
+        _parse_memory_amount("10%", option_name="--x", total_bytes=20 * 1024**3)
+        == 2 * 1024**3
+    )
+
+
+def test_apply_memory_budgets_sets_vram_headroom_and_ram_budget():
+    hw = _hw_with_gpu(16)
+
+    _apply_memory_budgets(hw, vram_headroom="1GB", ram_budget="8GB")
+
+    assert hw.gpus[0].vram_bytes == 16 * 1024**3
+    assert hw.gpus[0].usable_vram_bytes == 15 * 1024**3
+    assert hw.ram_budget_bytes == 8 * 1024**3
+    assert any("VRAM headroom" in note for note in hw.budget_notes)
+    assert any("RAM budget" in note for note in hw.budget_notes)
+
+
+def test_apply_memory_budgets_validates_vram_headroom_without_gpus():
+    hw = HardwareInfo(gpus=[], ram_bytes=16 * 1024**3)
+
+    with pytest.raises(Exit):
+        _apply_memory_budgets(hw, vram_headroom="nope", ram_budget=None)
+
+
+def test_apply_memory_budgets_accepts_valid_noop_vram_headroom_without_gpus():
+    hw = HardwareInfo(gpus=[], ram_bytes=16 * 1024**3)
+
+    _apply_memory_budgets(hw, vram_headroom="10%", ram_budget=None)
+
+    assert hw.gpus == []
+    assert hw.ram_budget_bytes is None
+
+
+def test_main_passes_gpu_only_fit_filter(monkeypatch):
+    model = ModelInfo(
+        id="org/Test-7B",
+        family_id="test-7b",
+        name="Test-7B",
+        parameter_count=7_000_000_000,
+        downloads=1,
+        likes=1,
+        published_at="2026-01-01T00:00:00.000Z",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_rank_models(models, hardware, **kwargs):
+        captured["fit_filter"] = kwargs.get("fit_filter")
+        return [
+            CompatibilityResult(
+                model=model,
+                gguf_variant=None,
+                can_run=True,
+                vram_required_bytes=4 * 1024**3,
+                vram_available_bytes=8 * 1024**3,
+                fit_type="full_gpu",
+                quality_score=80.0,
+            )
+        ]
+
+    monkeypatch.setattr(
+        "whichllm.hardware.detector.detect_hardware", lambda: _hw_with_gpu(8)
+    )
+    monkeypatch.setattr("whichllm.models.cache.load_cache", lambda: [])
+    monkeypatch.setattr("whichllm.models.benchmark.load_benchmark_cache", lambda: {})
+    monkeypatch.setattr("whichllm.engine.ranker.rank_models", fake_rank_models)
+    monkeypatch.setattr(
+        "whichllm.output.display.display_hardware", lambda hardware: None
+    )
+    monkeypatch.setattr(
+        "whichllm.output.display.display_ranking",
+        lambda results, **kwargs: None,
+    )
+
+    result = CliRunner().invoke(app, ["--gpu-only"])
+
+    assert result.exit_code == 0
+    assert captured["fit_filter"] == "full_gpu"
+
+
+def test_main_passes_speed_preset_and_default_runtime_columns(monkeypatch):
+    model = ModelInfo(
+        id="org/Test-7B",
+        family_id="test-7b",
+        name="Test-7B",
+        parameter_count=7_000_000_000,
+        downloads=1,
+        likes=1,
+        published_at="2026-01-01T00:00:00.000Z",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_rank_models(models, hardware, **kwargs):
+        captured["min_speed"] = kwargs.get("min_speed")
+        return [
+            CompatibilityResult(
+                model=model,
+                gguf_variant=None,
+                can_run=True,
+                vram_required_bytes=4 * 1024**3,
+                vram_available_bytes=8 * 1024**3,
+                fit_type="full_gpu",
+                estimated_tok_per_sec=8.0,
+                quality_score=80.0,
+            )
+        ]
+
+    def fake_display_ranking(results, **kwargs):
+        captured["show_status"] = kwargs.get("show_status")
+
+    monkeypatch.setattr(
+        "whichllm.hardware.detector.detect_hardware", lambda: _hw_with_gpu(8)
+    )
+    monkeypatch.setattr("whichllm.models.cache.load_cache", lambda: [])
+    monkeypatch.setattr("whichllm.models.benchmark.load_benchmark_cache", lambda: {})
+    monkeypatch.setattr("whichllm.engine.ranker.rank_models", fake_rank_models)
+    monkeypatch.setattr(
+        "whichllm.output.display.display_hardware", lambda hardware: None
+    )
+    monkeypatch.setattr("whichllm.output.display.display_ranking", fake_display_ranking)
+
+    result = CliRunner().invoke(app, ["--speed", "usable"])
+
+    assert result.exit_code == 0
+    assert captured["min_speed"] == 10.0
+    assert captured["show_status"] is True
+
+
+def test_main_details_flag_restores_metadata_columns(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_rank_models(models, hardware, **kwargs):
+        return []
+
+    def fake_display_ranking(results, **kwargs):
+        captured["show_status"] = kwargs.get("show_status")
+
+    monkeypatch.setattr(
+        "whichllm.hardware.detector.detect_hardware", lambda: _hw_with_gpu(8)
+    )
+    monkeypatch.setattr("whichllm.models.cache.load_cache", lambda: [])
+    monkeypatch.setattr("whichllm.models.benchmark.load_benchmark_cache", lambda: {})
+    monkeypatch.setattr("whichllm.engine.ranker.rank_models", fake_rank_models)
+    monkeypatch.setattr(
+        "whichllm.output.display.display_hardware", lambda hardware: None
+    )
+    monkeypatch.setattr("whichllm.output.display.display_ranking", fake_display_ranking)
+
+    result = CliRunner().invoke(app, ["--details", "--min-params", "1"])
+
+    assert result.exit_code == 0
+    assert captured["show_status"] is False
+
+
+def test_main_markdown_alias_dispatches_markdown_output(monkeypatch):
+    model = ModelInfo(
+        id="org/Test-7B",
+        family_id="test-7b",
+        name="Test-7B",
+        parameter_count=7_000_000_000,
+        downloads=1,
+        likes=1,
+        published_at="2026-01-01T00:00:00.000Z",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_rank_models(models, hardware, **kwargs):
+        return [
+            CompatibilityResult(
+                model=model,
+                gguf_variant=None,
+                can_run=True,
+                vram_required_bytes=4 * 1024**3,
+                vram_available_bytes=8 * 1024**3,
+                fit_type="full_gpu",
+                estimated_tok_per_sec=12.0,
+                quality_score=80.0,
+            )
+        ]
+
+    def fake_display_markdown(results, hardware, **kwargs):
+        captured["called"] = True
+        captured["show_status"] = kwargs.get("show_status")
+
+    def fail_display_hardware(hardware):
+        raise AssertionError("markdown output should not render Rich hardware panel")
+
+    monkeypatch.setattr(
+        "whichllm.hardware.detector.detect_hardware", lambda: _hw_with_gpu(8)
+    )
+    monkeypatch.setattr("whichllm.models.cache.load_cache", lambda: [])
+    monkeypatch.setattr("whichllm.models.benchmark.load_benchmark_cache", lambda: {})
+    monkeypatch.setattr("whichllm.engine.ranker.rank_models", fake_rank_models)
+    monkeypatch.setattr(
+        "whichllm.output.display.display_markdown", fake_display_markdown
+    )
+    monkeypatch.setattr(
+        "whichllm.output.display.display_hardware", fail_display_hardware
+    )
+
+    result = CliRunner().invoke(app, ["-m"])
+
+    assert result.exit_code == 0
+    assert captured["called"] is True
+    assert captured["show_status"] is True
+
+
+def test_main_json_and_markdown_are_mutually_exclusive():
+    result = CliRunner().invoke(app, ["--json", "--markdown"])
+
+    assert result.exit_code == 1
+    assert "--json and --markdown are mutually exclusive" in result.stdout
+
+
+def test_main_top_zero_rejected():
+    result = CliRunner().invoke(app, ["--top", "0"])
+
+    assert result.exit_code == 1
+    assert "--top must be 1 or greater" in result.stdout
+
+
+def test_main_top_negative_rejected():
+    # ``results[:-5]`` would silently drop the best-ranked models.
+    result = CliRunner().invoke(app, ["--top=-5"])
+
+    assert result.exit_code == 1
+    assert "--top must be 1 or greater" in result.stdout
+
+
+def test_main_negative_min_speed_rejected():
+    result = CliRunner().invoke(app, ["--min-speed=-1"])
+
+    assert result.exit_code == 1
+    assert "--min-speed must be 0 or greater" in result.stdout
+
+
+def test_main_negative_min_params_rejected():
+    result = CliRunner().invoke(app, ["--min-params=-2"])
+
+    assert result.exit_code == 1
+    assert "--min-params must be 0 or greater" in result.stdout
+
+
+def test_validate_ranking_flags_accepts_valid_values():
+    # A valid combination must not raise (no recommendations are dropped).
+    cli_mod._validate_ranking_flags(top=10, min_speed=0.0, min_params=None)
+    cli_mod._validate_ranking_flags(top=1, min_speed=None, min_params=7.0)
+
+
+def test_upgrade_top_zero_rejected():
+    # The upgrade command shares the same --top -> results[:top_n] hazard.
+    result = CliRunner().invoke(app, ["upgrade", "RTX 4090", "--top", "0"])
+
+    assert result.exit_code == 1
+    assert "--top must be 1 or greater" in result.stdout
+
+
+def test_main_empty_gpu_only_result_shows_fit_message(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_rank_models(models, hardware, **kwargs):
+        return []
+
+    def fake_display_ranking(results, **kwargs):
+        captured["empty_message"] = kwargs.get("empty_message")
+
+    monkeypatch.setattr(
+        "whichllm.hardware.detector.detect_hardware", lambda: _hw_with_gpu(8)
+    )
+    monkeypatch.setattr("whichllm.models.cache.load_cache", lambda: [])
+    monkeypatch.setattr("whichllm.models.benchmark.load_benchmark_cache", lambda: {})
+    monkeypatch.setattr("whichllm.engine.ranker.rank_models", fake_rank_models)
+    monkeypatch.setattr(
+        "whichllm.output.display.display_hardware", lambda hardware: None
+    )
+    monkeypatch.setattr("whichllm.output.display.display_ranking", fake_display_ranking)
+
+    result = CliRunner().invoke(app, ["--fit", "full-gpu", "--min-params", "1"])
+
+    assert result.exit_code == 0
+    assert "No full-GPU models found" in captured["empty_message"]
+
+
 # --------------- plan command tests ---------------
 
 
-def test_plan_no_model_found_shows_error():
+def test_plan_no_model_found_shows_error(monkeypatch):
+    monkeypatch.setattr("whichllm.models.cache.load_cache", lambda: [])
     runner = CliRunner()
     result = runner.invoke(app, ["plan", "nonexistent_model_xyz_999"])
     assert result.exit_code != 0
@@ -201,14 +704,14 @@ def test_plan_display_plan_json_outputs_valid_json():
     )
     # Capture output
     buf = StringIO()
-    import whichllm.output.display as disp_mod
+    import whichllm.output._console as console_mod
 
-    orig_console = disp_mod.console
-    disp_mod.console = Console(file=buf, force_terminal=False)
+    orig_console = console_mod.console
+    console_mod.console = Console(file=buf, force_terminal=False)
     try:
         display_plan_json(model, context_length=4096, target_quant="Q4_K_M")
     finally:
-        disp_mod.console = orig_console
+        console_mod.console = orig_console
     raw = buf.getvalue().strip()
     data = json_mod.loads(raw)
     assert data["model"]["id"] == "test-org/Test-Model-7B-GGUF"
@@ -220,12 +723,17 @@ def test_plan_display_plan_json_outputs_valid_json():
 # --------------- helper tests ---------------
 
 
-def _make_model(model_id="org/Test-7B-GGUF", downloads=100, gguf_variants=None):
+def _make_model(
+    model_id="org/Test-7B-GGUF",
+    downloads=100,
+    gguf_variants=None,
+    parameter_count=7_000_000_000,
+):
     return ModelInfo(
         id=model_id,
         family_id="test-7b",
         name="Test-7B",
-        parameter_count=7_000_000_000,
+        parameter_count=parameter_count,
         downloads=downloads,
         likes=10,
         gguf_variants=gguf_variants or [],
@@ -254,6 +762,171 @@ def test_search_model_not_found():
     models = [_make_model("org/Llama-8B")]
     with pytest.raises(Exit):
         _search_model(models, "nonexistent_xyz")
+
+
+# --- regression tests for size-token substring matching (#107) ---
+
+
+def test_search_model_7b_does_not_match_1_7b():
+    """'qwen 7b' should NOT match Qwen3-1.7B (issue #107)."""
+    models = [
+        _make_model(
+            "org/Qwen3-1.7B-GGUF", downloads=9999, parameter_count=1_700_000_000
+        ),
+        _make_model("org/Qwen3-7B-GGUF", downloads=100, parameter_count=7_000_000_000),
+    ]
+    result = _search_model(models, "qwen 7b")
+    assert result.id == "org/Qwen3-7B-GGUF"
+
+
+def test_search_model_2b_does_not_match_12b():
+    """'gemma 2b' should NOT match gemma-3-12b-it (issue #107)."""
+    models = [
+        _make_model(
+            "google/gemma-3-12b-it", downloads=5000, parameter_count=12_000_000_000
+        ),
+        _make_model("google/gemma-2b", downloads=100, parameter_count=2_000_000_000),
+    ]
+    result = _search_model(models, "gemma 2b")
+    assert result.id == "google/gemma-2b"
+
+
+def test_search_model_3b_does_not_match_30b_a3b():
+    """'qwen 3b' should NOT match Qwen3-30B-A3B (issue #107)."""
+    models = [
+        _make_model(
+            "org/Qwen3-30B-A3B-GGUF", downloads=8000, parameter_count=30_000_000_000
+        ),
+        _make_model("org/Qwen3-3B-GGUF", downloads=50, parameter_count=3_000_000_000),
+    ]
+    result = _search_model(models, "qwen 3b")
+    assert result.id == "org/Qwen3-3B-GGUF"
+
+
+def test_search_model_no_size_token_still_works():
+    """Queries without a size token should still use plain substring matching."""
+    models = [
+        _make_model("org/Llama-3.1-8B-GGUF", parameter_count=8_000_000_000),
+        _make_model("org/Qwen-7B", parameter_count=7_000_000_000),
+    ]
+    result = _search_model(models, "llama gguf")
+    assert result.id == "org/Llama-3.1-8B-GGUF"
+
+
+def test_search_model_millions_size_token():
+    """'500m' size token should match a ~500M parameter model."""
+    models = [
+        _make_model("org/SmolLM-500M", downloads=200, parameter_count=500_000_000),
+        _make_model("org/SmolLM-1.7B", downloads=300, parameter_count=1_700_000_000),
+    ]
+    result = _search_model(models, "smollm 500m")
+    assert result.id == "org/SmolLM-500M"
+
+
+def test_search_model_decimal_size_token():
+    """'0.5b' size token should match a ~500M parameter model."""
+    models = [
+        _make_model("org/TinyModel-0.5B", downloads=100, parameter_count=500_000_000),
+        _make_model("org/TinyModel-3B", downloads=500, parameter_count=3_000_000_000),
+    ]
+    result = _search_model(models, "tinymodel 0.5b")
+    assert result.id == "org/TinyModel-0.5B"
+
+
+def test_search_model_zero_param_count_passes_through():
+    """Models with parameter_count=0 (missing metadata) should not be excluded."""
+    models = [
+        _make_model("org/Mystery-7B-GGUF", downloads=500, parameter_count=0),
+    ]
+    result = _search_model(models, "mystery 7b")
+    assert result.id == "org/Mystery-7B-GGUF"
+
+
+def test_search_model_first_size_token_wins():
+    """When multiple size tokens appear, only the first is used as a filter."""
+    models = [
+        _make_model(
+            "org/Qwen3-30B-A3B-GGUF", downloads=8000, parameter_count=30_000_000_000
+        ),
+        _make_model(
+            "org/Qwen3-7B-3B-GGUF", downloads=100, parameter_count=7_000_000_000
+        ),
+    ]
+    # "7b" is the first size token and filters by ~7B; "3b" becomes a text term
+    result = _search_model(models, "qwen 7b 3b")
+    assert result.id == "org/Qwen3-7B-3B-GGUF"
+
+
+def test_search_model_7b_prefers_closest_size_over_downloads():
+    """'qwen 7b' should pick 8B (closest to 7B) over 4B even if 4B has more downloads."""
+    models = [
+        _make_model("org/Qwen3-4B-GGUF", downloads=9000, parameter_count=4_000_000_000),
+        _make_model("org/Qwen3-8B-GGUF", downloads=100, parameter_count=8_000_000_000),
+    ]
+    result = _search_model(models, "qwen 7b")
+    assert result.id == "org/Qwen3-8B-GGUF"
+
+
+def test_search_model_3b_prefers_closest_size_over_downloads():
+    """'qwen 3b' should pick 3B (exact) over 4B even if 4B has more downloads."""
+    models = [
+        _make_model("org/Qwen3-4B-GGUF", downloads=9000, parameter_count=4_000_000_000),
+        _make_model("org/Qwen3-3B-GGUF", downloads=50, parameter_count=3_000_000_000),
+    ]
+    result = _search_model(models, "qwen 3b")
+    assert result.id == "org/Qwen3-3B-GGUF"
+
+
+def test_search_model_size_tiebreak_falls_back_to_downloads():
+    """When two models are equally close in size, prefer the one with more downloads."""
+    models = [
+        _make_model(
+            "org/Qwen3-8B-A-GGUF", downloads=100, parameter_count=8_000_000_000
+        ),
+        _make_model(
+            "org/Qwen3-8B-B-GGUF", downloads=500, parameter_count=8_000_000_000
+        ),
+    ]
+    result = _search_model(models, "qwen 7b")
+    assert result.id == "org/Qwen3-8B-B-GGUF"
+
+
+def test_search_model_unknown_param_count_ranks_after_known():
+    """Models with parameter_count=0 should rank after models with known sizes."""
+    models = [
+        _make_model("org/Qwen3-Unknown-GGUF", downloads=9999, parameter_count=0),
+        _make_model("org/Qwen3-7B-GGUF", downloads=10, parameter_count=7_000_000_000),
+    ]
+    result = _search_model(models, "qwen 7b")
+    assert result.id == "org/Qwen3-7B-GGUF"
+
+
+@pytest.mark.parametrize(
+    "model_id, expected",
+    [
+        ("org/Qwen3-8B-GGUF", 8.0),
+        ("org/Qwen3.5-9B-NVFP4", 9.0),
+        ("org/Qwen3-30B-A3B-GGUF", 30.0),
+        ("org/SmolLM-500M", 0.5),
+        ("org/TinyModel-1.7B-Chat", 1.7),
+        ("org/Llama-3.1-8B-Instruct", 8.0),
+        ("org/NoSizeLabel-GGUF", None),
+    ],
+)
+def test_extract_id_size_b(model_id, expected):
+    assert _extract_id_size_b(model_id) == expected
+
+
+def test_search_model_7b_prefers_id_label_over_param_count():
+    """'qwen 7b' should not pick a 9B-labeled repo even if its param count is closer."""
+    models = [
+        _make_model(
+            "org/Qwen3.5-9B-NVFP4", downloads=500, parameter_count=6_600_000_000
+        ),
+        _make_model("org/Qwen3-8B-GGUF", downloads=100, parameter_count=8_000_000_000),
+    ]
+    result = _search_model(models, "qwen 7b")
+    assert result.id == "org/Qwen3-8B-GGUF"
 
 
 def test_pick_gguf_variant_by_preference():
@@ -297,6 +970,8 @@ def test_resolve_ranked_synthetic_gguf_to_real_repo():
         parameter_count=27_000_000_000,
         downloads=200_000,
         base_model="Qwen/Qwen3.6-27B",
+        base_model_relation="quantized",
+        tags=("base_model:quantized:Qwen/Qwen3.6-27B",),
         gguf_variants=[
             GGUFVariant(
                 filename="Qwen3.6-27B-Q4_K_M.gguf",
@@ -317,6 +992,269 @@ def test_resolve_ranked_synthetic_gguf_to_real_repo():
     model, variant = resolved
     assert model.id == "unsloth/Qwen3.6-27B-GGUF"
     assert variant.filename == "Qwen3.6-27B-Q4_K_M.gguf"
+
+
+def test_resolve_ranked_synthetic_gguf_rejects_finetuned_repo():
+    selected = ModelInfo(
+        id="Qwen/Qwen3.6-27B",
+        family_id="qwen3-27b",
+        name="Qwen3.6-27B",
+        parameter_count=27_000_000_000,
+    )
+    finetuned_gguf = ModelInfo(
+        id="converter/Qwen3.6-27B-MTP-pi-tune-GGUF",
+        family_id="qwen3-27b",
+        name="Qwen3.6-27B-MTP-pi-tune-GGUF",
+        parameter_count=27_000_000_000,
+        downloads=1_000_000,
+        base_model="Qwen/Qwen3.6-27B",
+        base_model_relation="finetune",
+        tags=("base_model:finetune:Qwen/Qwen3.6-27B",),
+        gguf_variants=[
+            GGUFVariant(
+                filename="Qwen3.6-27B-MTP-Q4_K_M.gguf",
+                quant_type="Q4_K_M",
+                file_size_bytes=16_000_000_000,
+            )
+        ],
+    )
+    synthetic = GGUFVariant(
+        filename="Qwen3.6-27B.Q4_K_M.gguf",
+        quant_type="Q4_K_M",
+        file_size_bytes=16_000_000_000,
+    )
+
+    resolved = _resolve_ranked_gguf_for_run(
+        selected,
+        synthetic,
+        [selected, finetuned_gguf],
+    )
+
+    assert resolved is None
+
+
+def test_resolve_ranked_synthetic_gguf_rejects_unproven_base_relation():
+    selected = ModelInfo(
+        id="google/gemma-4-31B-it",
+        family_id="gemma-4-31b-it",
+        name="gemma-4-31B-it",
+        parameter_count=31_000_000_000,
+    )
+    unproven_gguf = ModelInfo(
+        id="converter/Gemma-4-31B-custom-GGUF",
+        family_id="gemma-4-31b-it",
+        name="Gemma-4-31B-custom-GGUF",
+        parameter_count=31_000_000_000,
+        downloads=1_000_000,
+        base_model="google/gemma-4-31b-it",
+        gguf_variants=[
+            GGUFVariant(
+                filename="Gemma-4-31B-Q4_K_M.gguf",
+                quant_type="Q4_K_M",
+                file_size_bytes=19_000_000_000,
+            )
+        ],
+    )
+    synthetic = GGUFVariant(
+        filename="gemma-4-31B-it.Q4_K_M.gguf",
+        quant_type="Q4_K_M",
+        file_size_bytes=19_000_000_000,
+    )
+
+    resolved = _resolve_ranked_gguf_for_run(
+        selected,
+        synthetic,
+        [selected, unproven_gguf],
+    )
+
+    assert resolved is None
+
+
+def test_resolve_ranked_synthetic_gguf_rejects_other_quantized_checkpoint():
+    selected = ModelInfo(
+        id="Qwen/Qwen3.6-27B",
+        family_id="qwen3-27b",
+        name="Qwen3.6-27B",
+        parameter_count=27_000_000_000,
+    )
+    other_checkpoint = ModelInfo(
+        id="converter/Qwen3.6-27B-tuned-GGUF",
+        family_id="qwen3-27b",
+        name="Qwen3.6-27B-tuned-GGUF",
+        parameter_count=27_000_000_000,
+        base_model="tuner/Qwen3.6-27B-tuned",
+        base_model_relation="quantized",
+        tags=("base_model:quantized:tuner/Qwen3.6-27B-tuned",),
+        gguf_variants=[
+            GGUFVariant(
+                filename="Qwen3.6-27B-tuned-Q4_K_M.gguf",
+                quant_type="Q4_K_M",
+                file_size_bytes=16_000_000_000,
+            )
+        ],
+    )
+    synthetic = GGUFVariant(
+        filename="Qwen3.6-27B.Q4_K_M.gguf",
+        quant_type="Q4_K_M",
+        file_size_bytes=16_000_000_000,
+    )
+
+    resolved = _resolve_ranked_gguf_for_run(
+        selected,
+        synthetic,
+        [selected, other_checkpoint],
+    )
+
+    assert resolved is None
+
+
+def test_resolve_ranked_synthetic_gguf_rejects_renamed_merge_claiming_quantized():
+    selected = ModelInfo(
+        id="Qwen/Qwen3.6-27B",
+        family_id="qwen3-27b",
+        name="Qwen3.6-27B",
+        parameter_count=27_000_000_000,
+    )
+    merged_gguf = ModelInfo(
+        id="converter/Qwopus3.6-27B-Fusion-GGUF",
+        family_id="qwen3-27b",
+        name="Qwopus3.6-27B-Fusion-GGUF",
+        parameter_count=27_000_000_000,
+        downloads=1_000_000,
+        base_model="Qwen/Qwen3.6-27B",
+        base_model_relation="quantized",
+        tags=(
+            "gguf",
+            "merge",
+            "task-vector",
+            "base_model:quantized:Qwen/Qwen3.6-27B",
+        ),
+        gguf_variants=[
+            GGUFVariant(
+                filename="Qwopus3.6-27B-Fusion-Q5_K_M.gguf",
+                quant_type="Q5_K_M",
+                file_size_bytes=19_000_000_000,
+            )
+        ],
+    )
+    synthetic = GGUFVariant(
+        filename="Qwen3.6-27B.Q5_K_M.gguf",
+        quant_type="Q5_K_M",
+        file_size_bytes=19_000_000_000,
+    )
+
+    resolved = _resolve_ranked_gguf_for_run(
+        selected,
+        synthetic,
+        [selected, merged_gguf],
+    )
+
+    assert resolved is None
+
+
+def test_resolve_ranked_synthetic_gguf_rejects_conflicting_base_relations():
+    selected = ModelInfo(
+        id="Qwen/Qwen3.6-27B",
+        family_id="qwen3-27b",
+        name="Qwen3.6-27B",
+        parameter_count=27_000_000_000,
+    )
+    merged_gguf = ModelInfo(
+        id="converter/Qwen3.6-27B-GGUF",
+        family_id="qwen3-27b",
+        name="Qwen3.6-27B-GGUF",
+        parameter_count=27_000_000_000,
+        base_model="Qwen/Qwen3.6-27B",
+        base_model_relation="quantized",
+        tags=(
+            "gguf",
+            "base_model:quantized:Qwen/Qwen3.6-27B",
+            "base_model:finetune:Qwen/Qwen3.6-27B",
+        ),
+        gguf_variants=[
+            GGUFVariant(
+                filename="Qwen3.6-27B-Q4_K_M.gguf",
+                quant_type="Q4_K_M",
+                file_size_bytes=16_000_000_000,
+            )
+        ],
+    )
+    synthetic = GGUFVariant(
+        filename="Qwen3.6-27B.Q4_K_M.gguf",
+        quant_type="Q4_K_M",
+        file_size_bytes=16_000_000_000,
+    )
+
+    assert (
+        _resolve_ranked_gguf_for_run(
+            selected,
+            synthetic,
+            [selected, merged_gguf],
+        )
+        is None
+    )
+
+
+def test_resolve_ranked_existing_gguf_repo_does_not_require_base_relation():
+    direct_gguf = ModelInfo(
+        id="author/custom-model-GGUF",
+        family_id="custom-model",
+        name="custom-model-GGUF",
+        parameter_count=7_000_000_000,
+        gguf_variants=[
+            GGUFVariant(
+                filename="custom-model-Q4_K_M.gguf",
+                quant_type="Q4_K_M",
+                file_size_bytes=4_000_000_000,
+            )
+        ],
+    )
+
+    resolved = _resolve_ranked_gguf_for_run(
+        direct_gguf,
+        direct_gguf.gguf_variants[0],
+        [direct_gguf],
+    )
+
+    assert resolved == (direct_gguf, direct_gguf.gguf_variants[0])
+
+
+def test_resolve_ranked_synthetic_gguf_accepts_owner_prefixed_conversion_name():
+    selected = ModelInfo(
+        id="Qwen/Qwen3.6-27B",
+        family_id="qwen3-27b",
+        name="Qwen3.6-27B",
+        parameter_count=27_000_000_000,
+    )
+    direct_gguf = ModelInfo(
+        id="converter/Qwen_Qwen3.6-27B-GGUF",
+        family_id="qwen3-27b",
+        name="Qwen_Qwen3.6-27B-GGUF",
+        parameter_count=27_000_000_000,
+        base_model="Qwen/Qwen3.6-27B",
+        base_model_relation="quantized",
+        tags=("base_model:quantized:Qwen/Qwen3.6-27B",),
+        gguf_variants=[
+            GGUFVariant(
+                filename="Qwen3.6-27B-Q4_K_M.gguf",
+                quant_type="Q4_K_M",
+                file_size_bytes=16_000_000_000,
+            )
+        ],
+    )
+    synthetic = GGUFVariant(
+        filename="Qwen3.6-27B.Q4_K_M.gguf",
+        quant_type="Q4_K_M",
+        file_size_bytes=16_000_000_000,
+    )
+
+    resolved = _resolve_ranked_gguf_for_run(
+        selected,
+        synthetic,
+        [selected, direct_gguf],
+    )
+
+    assert resolved == (direct_gguf, direct_gguf.gguf_variants[0])
 
 
 def test_resolve_ranked_synthetic_gguf_prefers_exact_quant():
@@ -346,6 +1284,9 @@ def test_resolve_ranked_synthetic_gguf_prefers_exact_quant():
         name="Qwen3.6-27B-GGUF",
         parameter_count=27_000_000_000,
         downloads=10,
+        base_model="Qwen/Qwen3.6-27B",
+        base_model_relation="quantized",
+        tags=("base_model:quantized:Qwen/Qwen3.6-27B",),
         gguf_variants=[
             GGUFVariant(
                 filename="q4.gguf",
@@ -469,15 +1410,25 @@ def test_resolve_ranked_synthetic_gguf_rejects_size_mismatch():
 # --------------- run/snippet command tests ---------------
 
 
-def test_run_exits_gracefully():
-    """run should fail gracefully (uv missing, or no model found)."""
+def test_run_requires_uv(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda _: None)
+
     runner = CliRunner()
     result = runner.invoke(app, ["run", "some-model"])
-    if result.exit_code != 0:
-        assert any(
-            msg in result.stdout
-            for msg in ("uv is required", "No model found", "llama-cpp-python")
-        )
+
+    assert result.exit_code == 1
+    assert "uv is required" in result.stdout
+
+
+def test_run_no_model_found_exits_gracefully(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/uv")
+    monkeypatch.setattr(cli_mod, "_load_models", lambda refresh: [])
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "some-model"])
+
+    assert result.exit_code == 1
+    assert "No model found" in result.stdout
 
 
 def test_transformers_chat_script_passes_tokenizer_mapping_to_generate():
@@ -490,6 +1441,65 @@ def test_transformers_chat_script_passes_tokenizer_mapping_to_generate():
     assert "return_dict=True" in script
     assert "kwargs=dict(**inputs, max_new_tokens=512, streamer=streamer)" in script
     assert "kwargs=dict(input_ids=inputs" not in script
+
+
+def test_transformers_chat_script_provides_disk_offload_folder():
+    model = _make_model(model_id="org/Test-7B")
+
+    script = _generate_chat_script(
+        model, variant=None, context_length=4096, cpu_only=False
+    )
+
+    assert 'tempfile.mkdtemp(prefix="whichllm_transformers_offload_")' in script
+    assert "offload_folder=offload_folder" in script
+    assert "shutil.rmtree(offload_folder, ignore_errors=True)" in script
+
+
+def test_gguf_chat_script_treats_hf_metadata_as_literals():
+    model = _make_model(model_id="org/Test-7B")
+    filename = 'weights-Q4_K_M.gguf"); print("injected"); #.gguf'
+    variant = GGUFVariant(
+        filename=filename,
+        quant_type="Q4_K_M",
+        file_size_bytes=1,
+    )
+
+    tree = ast.parse(
+        _generate_chat_script(model, variant, context_length=4096, cpu_only=False)
+    )
+    assignments = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in {"model_id", "filename", "quant_type"}
+    }
+
+    assert assignments == {
+        "model_id": model.id,
+        "filename": filename,
+        "quant_type": variant.quant_type,
+    }
+
+
+def test_snippet_treats_hf_metadata_as_literals(monkeypatch):
+    filename = 'weights-Q4_K_M.gguf"); print("injected"); #.gguf'
+    model = _make_model(model_id="org/Test-7B")
+    model.gguf_variants = [
+        GGUFVariant(
+            filename=filename,
+            quant_type="Q4_K_M",
+            file_size_bytes=1,
+        )
+    ]
+    monkeypatch.setattr(cli_mod, "_load_models", lambda refresh: [model])
+
+    result = CliRunner().invoke(app, ["snippet", "Test-7B"])
+
+    assert result.exit_code == 0
+    assert f"repo_id={model.id!r}" in result.stdout
+    assert f"filename={filename!r}" in result.stdout
 
 
 def test_run_auto_pick_resolves_ranked_gguf_before_launch(monkeypatch):
@@ -507,6 +1517,8 @@ def test_run_auto_pick_resolves_ranked_gguf_before_launch(monkeypatch):
         parameter_count=27_000_000_000,
         downloads=200_000,
         base_model="Qwen/Qwen3.6-27B",
+        base_model_relation="quantized",
+        tags=("base_model:quantized:Qwen/Qwen3.6-27B",),
         gguf_variants=[
             GGUFVariant(
                 filename="q4.gguf",
@@ -567,8 +1579,132 @@ def test_run_auto_pick_resolves_ranked_gguf_before_launch(monkeypatch):
     assert "transformers" not in captured["cmd"]
 
 
-def test_snippet_no_model_found():
+def test_snippet_no_model_found(monkeypatch):
+    monkeypatch.setattr(cli_mod, "_load_models", lambda refresh: [])
     runner = CliRunner()
     result = runner.invoke(app, ["snippet", "nonexistent_model_xyz_999"])
     assert result.exit_code != 0
     assert "No model found" in result.stdout
+
+
+def test_json_output_includes_benchmark_source_and_confidence():
+    """display_json should include benchmark_source and benchmark_confidence."""
+    import json as json_mod
+    from io import StringIO
+
+    from rich.console import Console
+
+    from whichllm.output.display import display_json
+
+    model = ModelInfo(
+        id="test-org/Test-7B",
+        family_id="test-7b",
+        name="Test-7B",
+        parameter_count=7_000_000_000,
+        downloads=100,
+        likes=10,
+    )
+    result = CompatibilityResult(
+        model=model,
+        gguf_variant=None,
+        can_run=True,
+        vram_required_bytes=8_000_000_000,
+        vram_available_bytes=24_000_000_000,
+        quality_score=55.0,
+        benchmark_status="estimated",
+        benchmark_source="line_interp",
+        benchmark_confidence=0.34,
+    )
+    hw = HardwareInfo(
+        gpus=[],
+        cpu_name="Test CPU",
+        cpu_cores=8,
+        ram_budget_bytes=32 * 1024**3,
+        ram_bytes=64 * 1024**3,
+        disk_free_bytes=500 * 1024**3,
+        os="linux",
+        budget_notes=["RAM budget: 32.0 GB"],
+    )
+
+    buf = StringIO()
+    import whichllm.output._console as console_mod
+
+    orig_console = console_mod.console
+    console_mod.console = Console(file=buf, force_terminal=False)
+    try:
+        display_json([result], hw)
+    finally:
+        console_mod.console = orig_console
+
+    data = json_mod.loads(buf.getvalue().strip())
+    entry = data["models"][0]
+    assert data["hardware"]["ram_budget_bytes"] == 32 * 1024**3
+    assert data["hardware"]["budget_notes"] == ["RAM budget: 32.0 GB"]
+    assert entry["artifact_repo_id"] is None
+    assert entry["artifact_filename"] is None
+    assert entry["benchmark_status"] == "estimated"
+    assert entry["benchmark_source"] == "line_interp"
+    assert entry["benchmark_confidence"] == 0.34
+
+
+def test_json_output_includes_resolved_artifact_fields():
+    """display_json should expose the actual GGUF repo/file when resolved."""
+    import json as json_mod
+    from io import StringIO
+
+    from rich.console import Console
+
+    from whichllm.output.display import display_json
+
+    model = ModelInfo(
+        id="Qwen/Qwen3-4B-Thinking-2507",
+        family_id="qwen3-4b-thinking",
+        name="Qwen3-4B-Thinking-2507",
+        parameter_count=4_000_000_000,
+    )
+    artifact = ModelInfo(
+        id="MaziyarPanahi/Qwen3-4B-Thinking-2507-GGUF",
+        family_id="qwen3-4b-thinking",
+        name="Qwen3-4B-Thinking-2507-GGUF",
+        parameter_count=4_000_000_000,
+    )
+    result = CompatibilityResult(
+        model=model,
+        gguf_variant=GGUFVariant(
+            filename="Qwen3-4B-Thinking-2507.Q3_K_M.gguf",
+            quant_type="Q3_K_M",
+            file_size_bytes=2_000_000_000,
+        ),
+        artifact_model=artifact,
+        artifact_variant=GGUFVariant(
+            filename="Qwen3-4B-Thinking-2507-Q3_K_M.gguf",
+            quant_type="Q3_K_M",
+            file_size_bytes=2_000_000_000,
+        ),
+        can_run=True,
+        vram_required_bytes=3_000_000_000,
+        vram_available_bytes=8_000_000_000,
+    )
+    hw = HardwareInfo(
+        gpus=[],
+        cpu_name="Test CPU",
+        cpu_cores=8,
+        ram_bytes=64 * 1024**3,
+        disk_free_bytes=500 * 1024**3,
+        os="linux",
+    )
+
+    buf = StringIO()
+    import whichllm.output._console as console_mod
+
+    orig_console = console_mod.console
+    console_mod.console = Console(file=buf, force_terminal=False)
+    try:
+        display_json([result], hw)
+    finally:
+        console_mod.console = orig_console
+
+    entry = json_mod.loads(buf.getvalue().strip())["models"][0]
+    assert entry["model_id"] == "Qwen/Qwen3-4B-Thinking-2507"
+    assert entry["artifact_repo_id"] == "MaziyarPanahi/Qwen3-4B-Thinking-2507-GGUF"
+    assert entry["artifact_filename"] == "Qwen3-4B-Thinking-2507-Q3_K_M.gguf"

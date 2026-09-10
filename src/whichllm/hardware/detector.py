@@ -6,12 +6,13 @@ import logging
 import platform
 
 from whichllm.hardware.amd import detect_amd_gpus
-from whichllm.hardware.apple import detect_apple_gpu
+from whichllm.hardware.apple import detect_apple_gpu, detect_apple_gpu_linux
 from whichllm.hardware.cpu import detect_avx_support, detect_cpu_cores, detect_cpu_name
 from whichllm.hardware.intel import detect_intel_gpus
 from whichllm.hardware.memory import detect_disk_free_bytes, detect_ram_bytes
 from whichllm.hardware.nvidia import detect_nvidia_gpus
 from whichllm.hardware.types import HardwareInfo
+from whichllm.hardware.windows import detect_windows_gpus
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +29,11 @@ def detect_hardware() -> HardwareInfo:
     if os_name == "linux":
         gpus.extend(detect_amd_gpus())
         gpus.extend(detect_intel_gpus())
+        gpus.extend(detect_apple_gpu_linux())
     if os_name == "darwin":
         gpus.extend(detect_apple_gpu())
+    if os_name == "windows":
+        gpus.extend(detect_windows_gpus())
 
     # CPU
     cpu_name = detect_cpu_name()

@@ -4,6 +4,251 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.5.16] - 2026-08-14
+
+### Changed
+
+- Split benchmark caching, fetching, indexing, lineage, lookup, and shared types
+  into focused modules while preserving the existing
+  `whichllm.models.benchmark` import surface. (#41, #143)
+- Locked the uv and Ruff versions used by contributors and required CI checks,
+  so unchanged commits are validated with the same development tools. (#150,
+  #151)
+
+### Fixed
+
+- Generated `whichllm run` and `whichllm snippet` scripts now encode model IDs,
+  GGUF filenames, and quantization types as Python literals, preventing crafted
+  Hugging Face metadata from changing the generated code structure. (#147)
+- Synthetic GGUF recommendations now resolve only to direct quantizations of
+  the selected checkpoint, rejecting fine-tunes, merges, conflicting lineage,
+  and artifacts without explicit provenance. (#155, #156)
+
+## [0.5.15] - 2026-07-03
+
+### Changed
+
+- Split the oversized Hugging Face model fetcher into focused modules while
+  keeping the existing `whichllm.models.fetcher` import surface. (#41, #140)
+
+### Fixed
+
+- Output now resolves ranked GGUF recommendations to the actual downloadable
+  artifact repo and filename when the ranked base model and runnable GGUF live
+  in different Hugging Face repos. (#137, #138)
+- AA index scoring now uses retuned normalization bounds and a refreshed
+  fallback snapshot for the reworked Artificial Analysis scale. (#101, #139)
+- Invalid ranking filters such as `--top 0`, negative `--min-speed`, and
+  negative `--min-params` now fail with clear errors instead of silently
+  producing wrong output. (#142)
+
+## [0.5.14] - 2026-06-29
+
+### Added
+
+- Added sliding-window attention metadata to model fetching and KV cache
+  estimation, improving VRAM estimates for models that use SWA. (#124)
+- Added curated Intel Arc Pro B70 / Battlemage G31 detection and simulation,
+  including the `0xe223` PCI device ID and 32 GB VRAM / 608 GB/s bandwidth
+  defaults. (#93, #136)
+
+### Fixed
+
+- Model and benchmark metadata fetches now request `gzip, deflate` instead of
+  brotli, avoiding broken `br` responses from mirrors or intermediate servers.
+  (#128, #136)
+
+## [0.5.13] - 2026-06-25
+
+### Added
+
+- Added `HF_ENDPOINT` support for Hugging Face model metadata fetches, so users
+  behind a mirror can point whichllm at a compatible Hub endpoint. (#128, #131)
+- Added manual detected-GPU overrides for usable VRAM and bandwidth, which helps
+  iGPU and unified-memory systems where automatic detection is too conservative.
+  (#132, #133)
+- README now points users toward safer first-run flags when they want
+  full-GPU, usable-speed recommendations with extra VRAM headroom.
+
+### Fixed
+
+- Search terms such as `7B`, `0.5B`, and `500M` now match model parameter size
+  instead of plain substrings, so `qwen 7b` no longer returns `1.7B` or
+  `30B-A3B` models by accident. (#107, #126)
+- GGUF sizing now treats FP16 and ternary `TQ1_0` / `TQ2_0` quant types
+  correctly, avoiding underestimates for those files. (#125)
+
+## [0.5.12] - 2026-06-18
+
+### Added
+
+- Default ranking tables now show memory required, estimated generation speed,
+  fit type, and published date. Download counts are still available with
+  `--details`.
+- Added `--speed any|usable|fast` as named generation-speed filters while
+  keeping `--min-speed` for exact tok/s thresholds.
+- Added `--fit gpu` as a natural alias for full-GPU-only recommendations.
+- Added `--markdown` / `-m` for pasteable GitHub-Flavored Markdown ranking
+  tables. (#111)
+- Added `--vram-headroom` and `--ram-budget` so users can avoid edge VRAM fits
+  and cap partial-offload planning to available or fixed system RAM.
+
+### Changed
+
+- Speed color now reflects practical generation speed. `~` and `?` remain
+  estimate-confidence markers instead of being the primary speed color.
+
+## [0.5.11] - 2026-06-18
+
+### Added
+
+- Multi-GPU simulation for repeated `--gpu` flags, comma-separated GPU specs,
+  and count shorthand such as `2x RTX 4090`. The fit model uses a conservative
+  effective VRAM budget and keeps speed confidence low for split-device
+  recommendations. (#113)
+- `python -m whichllm` now runs the CLI entrypoint. (#116)
+- `--gpu-only` and `--fit full-gpu` now filter recommendations to models that
+  fit fully in GPU VRAM. `--fit any` keeps the existing behavior. (#119, #122)
+- T5 lineage support so T5-family models get version-aware benchmark handling.
+
+### Fixed
+
+- Fixed UTF-8 decoding for cached model and benchmark data on systems whose
+  default filesystem encoding is not UTF-8. (#121)
+- GTX 1650 simulation now distinguishes GDDR5 and GDDR6 variants by memory
+  clock instead of treating every card as the slower 128 GB/s model. (#115)
+- RAM reserve logic now uses a bounded reserve formula instead of a fixed 80%
+  usable-RAM cap, which avoids underestimating machines with more system
+  memory. (#103)
+
+## [0.5.10] - 2026-06-11
+
+### Fixed
+
+- Strong partial-offload candidates are no longer buried below weaker full-GPU
+  models because the final ranking sort no longer counts full-GPU fit a second
+  time after runtime-fit and speed penalties have already been applied. Light
+  partial offload is penalized less aggressively, while heavy dense offload
+  remains strongly discounted. (#105, #108)
+- MoE partial-offload scoring now uses the active parameter working set when it
+  can plausibly stay on GPU, so active-small MoE models are not penalized like
+  dense models with the same total parameter count. (#105, #108)
+
+## [0.5.9] - 2026-06-10
+
+### Added
+
+- MXFP4 and NVFP4 4-bit quantization support across ID/filename parsing, VRAM
+  estimation, quality penalties, speed efficiency, and family grouping.
+  Repos shipping these formats were previously labeled FP16 and their VRAM
+  requirement overestimated about 3.5x. (#99)
+- Apple M5-family entries for `--gpu` simulation. (#92)
+- Kepler-era Quadro bandwidth and compute capability entries. (#75)
+
+### Fixed
+
+- AMD discrete GPU detection on Linux: rocm-smi names are read from the
+  correct `Card Series` key, compound lspci names such as
+  `Navi 22 [Radeon RX 6700/6700 XT/6750 XT ...]` resolve bandwidth, sysfs VRAM
+  enriches the fallback path, and discrete cards are no longer mislabeled
+  `shared memory`. Adds RX 6750 XT / RX 6700 / RX 6650 XT / RX 6600 series and
+  Radeon AI PRO R9700 to the bandwidth catalog. (#61, #68)
+- Community GGUF repos without `base_model` metadata (for example
+  `unsloth/...-GGUF`) now inherit the official model's benchmark score by
+  name matching instead of falling through to no evidence. (#94)
+- GPU bandwidth detection no longer depends solely on the hand-curated
+  catalog. When a detected card is missing from `GPU_BANDWIDTH`, bandwidth is
+  now resolved from the bundled TechPowerUp database (dbgpu, 2824 GPUs) using
+  strict name matching only: an exact normalized hit or a name plus VRAM-size
+  bin, never fuzzy. Laptop / Mobile / Max-Q names can no longer inherit a
+  desktop card's bandwidth, and VRAM bins written without a space
+  (`RTX A2000 12GB`) are recognized. This fixes the cluster of reports where
+  an uncatalogued GPU showed `BW: N/A`, was estimated at `0.0 tok/s`, and
+  received oversized recommendations (#74, #98).
+- Artificial Analysis Intelligence Index is fetched live again. The
+  artificialanalysis.ai leaderboard migrated to the Next.js App Router and no
+  longer ships a `__NEXT_DATA__` blob, so every run logged
+  `AA Index fetch failed ... __NEXT_DATA__ payload not found` and silently used
+  the frozen snapshot. The scraper now parses the App Router RSC stream
+  (`self.__next_f.push(...)`), canonicalizes AA's variant-suffixed display
+  names (`(Reasoning)`, `(high)`, ...) for mapping, and overlays live scores on
+  top of the curated fallback so a successful fetch can only add coverage. The
+  legacy `__NEXT_DATA__` path is kept as a secondary fallback.
+
+## [0.5.8] - 2026-06-05
+
+### Added
+
+- `--context-length` now accepts shorthand values such as `64k` and `128k`.
+- JSON ranking output now includes benchmark source and confidence metadata.
+- Asahi Linux / Apple Silicon detection now recognizes Apple CPU and GPU names.
+- Added GPU catalog coverage for `NVIDIA RTX A3000 Laptop GPU`, `RTX 3050`,
+  `RTX 5060`, `RTX 5070 Ti`, `RX 9070`, and `RX 9070 XT`.
+
+### Fixed
+
+- A3000 Laptop 6GB systems no longer get `0.0 tok/s` / heavy partial-offload
+  recommendations at the top just because bandwidth was missing.
+- Windows CPU detection now falls back through PowerShell/CIM when `wmic` does
+  not return a useful CPU name.
+- Models that cannot hold the requested context are demoted instead of staying
+  near the top of the ranking.
+- Hugging Face and benchmark fetches now retry transient failures such as 429s
+  before falling back or failing.
+- `Error fetching models:` now includes useful detail even when the underlying
+  network exception message is empty.
+- Upgrade tables now show `0 GB` VRAM instead of treating zero as missing.
+
+### Changed
+
+- Curated registry data was split out of `constants.py` into
+  `whichllm.data.*` modules.
+- Troubleshooting and cache documentation now better explain disk-cache paths
+  and stale fetch behavior.
+
+## [0.5.7] - 2026-05-20
+
+### Added
+
+- LiveBench fallback data is now kept inline so benchmark scoring remains
+  available without relying on a generated sidecar file.
+
+### Fixed
+
+- DGX Spark / NVIDIA GB10 is now detected as a shared-memory NVIDIA GPU when
+  NVIDIA reports `memory.total` as unavailable.
+- `whichllm run` now provides a Transformers `offload_folder`, avoiding crashes
+  when large models need disk offload.
+- Cache paths now respect `XDG_CACHE_HOME`, including ignoring relative values
+  per the XDG base directory specification.
+- Apple Silicon is now treated as shared memory in fit detection.
+- Benchmark score fetching now runs concurrently.
+
+## [0.5.6] - 2026-05-18
+
+### Added
+
+- Speed estimates now include confidence metadata and an estimated tok/s range
+  in table and JSON output, so uncertain backend/model predictions are visible.
+- Windows now has an AMD/Intel GPU detection fallback via
+  `Win32_VideoController`, including 64-bit registry memory reads for GPUs
+  where `AdapterRAM` is capped around 4 GB.
+
+### Fixed
+
+- MoE speed estimates now use active-parameter metadata and a
+  bandwidth-scaled read floor, improving shared-memory APU estimates without
+  over-promoting sparse models on high-bandwidth GPUs.
+- Newer MoE model metadata now recognizes A3B-style active-parameter names.
+- Ryzen AI / Radeon 890M-class Windows iGPUs are modeled as shared-memory AMD
+  GPUs instead of CPU-only or tiny-VRAM discrete GPUs.
+- Mixed dedicated-GPU plus shared-memory-iGPU systems no longer sum unrelated
+  memory pools as one full-GPU target.
+- Windows AMD GPUs no longer receive a misleading ROCm-only warning when
+  Vulkan or DirectML backends may be valid.
+
 ## [0.5.5] - 2026-05-17
 
 ### Fixed
